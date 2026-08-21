@@ -1,0 +1,40 @@
+# `@deepseek-ai/dsh-plan-execute` bundle patch: inserts the `/pe` command
+# plugin onto the host plane. `dsh plugin --profile web add <this-package>`
+# applies this layer; every field below is a validated Config knob the user may
+# override in a later patch layer (profile `cordis.patch.yml` /
+# `$DSH_HOME/cordis.patch.yml`).
+#
+# The row `name` MUST equal this package's `name` in package.json so the Loader
+# resolves the plugin module.
+
+- insert:
+    - id: plan-execute
+      name: '@deepseek-ai/dsh-plan-execute'
+      config:
+        # Subagent backend (in-process `spawn` ships in every profile).
+        provider: spawn
+        # Provider route used for every child; matches `agent-default-model`.
+        llmProvider: deepseek-official
+        # Pro plans & reviews, Flash executes.
+        plannerModel: deepseek-v4-pro
+        executorModel: deepseek-v4-flash
+        reviewerModel: deepseek-v4-pro
+        # ── rate-limit + cost guards (RequestBurstTooFast) ────────────────
+        # Max simultaneous executor children. Raise only if the API stops
+        # returning RequestBurstTooFast at 2.
+        maxConcurrency: 2
+        # Minimum delay between executor starts (jittered ±30%). Keep ≥800ms
+        # for gradual traffic growth.
+        stepIntervalMs: 800
+        # Flash retries per subtask before falling back to the planner model.
+        maxRetries: 2
+        # Run the Pro reviewer phase after execution.
+        review: true
+        # Ask the user to approve the plan before executing.
+        confirm: true
+        # Per-phase thinking effort (Flash off, Pro high; never max).
+        plannerEffort: high
+        executorEffort: off
+        reviewerEffort: high
+        # Delegation-depth cap for every child.
+        maxDepth: 3

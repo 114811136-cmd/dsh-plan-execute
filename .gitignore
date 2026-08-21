@@ -1,0 +1,13 @@
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Build artifacts are intentionally COMMITTED so `dsh plugin add github:...`
+# installs prebuilt code with no build authorization. Do NOT ignore lib/.
+# (If you change this, every install target must run a prepare build.)
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

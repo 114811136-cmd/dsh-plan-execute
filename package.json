@@ -1,0 +1,50 @@
+{
+  "name": "@deepseek-ai/dsh-plan-execute",
+  "description": "Slash command /pe: Pro-plan → Flash-execute → Pro-review over the subagent seam",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<your-user>/dsh-plan-execute.git"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.1.0",
+    "@deepseek-ai/schemastery": ">=0.1.0",
+    "@deepseek-ai/dsh-agent": ">=0.1.0",
+    "@deepseek-ai/dsh-commands": ">=0.1.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0",
+    "@deepseek-ai/dsh-subagent": ">=0.1.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0",
+    "@deepseek-ai/dsh-user-questions": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": ">=0.1.0",
+    "@deepseek-ai/schemastery": ">=0.1.0",
+    "@deepseek-ai/dsh-agent": ">=0.1.0",
+    "@deepseek-ai/dsh-commands": ">=0.1.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.0",
+    "@deepseek-ai/dsh-subagent": ">=0.1.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0",
+    "@deepseek-ai/dsh-user-questions": ">=0.1.0"
+  }
+}
