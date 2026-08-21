@@ -20,10 +20,31 @@
 
 ## 安装
 
+### 从 GitHub 安装（推荐，跨电脑一条命令）
+
+```sh
+# 新电脑装好同版本 dsh 后，一条命令即可（lib/ 已提交，无需构建授权）：
+dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute
+# 重启或热载入 web 后，聊天框斜杠菜单出现 /pe
+```
+
+私有仓库需目标电脑已配置 GitHub 凭据；公开仓库任何机器直接可用。
+
+### 从本地路径安装
+
 ```sh
 dsh plugin --profile web add <本包路径或 git 地址>
 # 重启或热载入 web 后，聊天框斜杠菜单出现 /pe
 ```
+
+### 从 tarball 安装（无网络/无 GitHub）
+
+```sh
+pnpm pack            # 生成 dsh-plan-execute-0.1.0.tgz
+dsh plugin --profile web add ./dsh-plan-execute-0.1.0.tgz
+```
+
+> 注意：`lib/` 构建产物已**提交进仓库**（见 `.gitignore`），所以任何安装方式都不需要目标机器运行构建脚本或授权 `prepare`。
 
 ## 可配置项（cordis.yml）
 
@@ -62,6 +83,16 @@ thinking 是 `llm-deepseek` 适配器的**全局默认**，`agentOptions` 带不
 1. 装同版本 DSH；
 2. 复制本包，`dsh plugin --profile web add <本包路径>`；
 3. 在「模型」页重填 `deepseek-v4-pro` / `deepseek-v4-flash` 的 API Key（或复制 `$DSH_HOME/.credentials.yaml`）。
+
+## 发布更新
+
+改完 `src/index.ts` 后重新编译出 `lib/`（当前在 DSH 源码 checkout 里编译），提交并推送：
+
+```sh
+git add -A && git commit -m "..." && git push
+```
+
+目标电脑重跑 `dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute`（或更新已装的 git 依赖）即可获取新版本。
 
 ## 实现前必做的 3 项核对（本骨架未伪造的部分）
 
