@@ -17,6 +17,16 @@
  * reuse the same system prefix and hit the provider KV cache instead of paying
  * for cold input tokens on every subtask.
  *
+ * Cancellation: every phase, worker scan, and retry loop checks the invocation
+ * `AbortSignal`, so pressing "停止生成" in the UI tears the whole pipeline down
+ * promptly instead of draining every queued task against an aborted signal.
+ *
+ * Thinking-effort injection is scoped per-plugin-instance and per-child (a
+ * `Map` keyed by child session id, populated at spawn and cleared at settle),
+ * so a running `/pe` can no longer rewrite the reasoning effort of ordinary
+ * concurrent chat, and a planner/reviewer sharing the same model still gets
+ * each phase's own effort level.
+ *
  * @module dsh-plan-execute
  */
 
@@ -32,11 +42,11 @@ import type {} from '@deepseek-ai/dsh-user-questions'
 export const name = 'plan-execute'
 export const inject = ['commands', 'subagents', 'userQuestions']
 
-/** Session ids of children THIS plugin spawned; the thinking override applies only to them. */
-const childSessions = new Set<string>()
-
 /** DeepSeek thinking effort levels accepted by the adapter. */
 type Effort = 'off' | 'low' | 'high' | 'max'
+
+/** Per-plugin-instance map from child session id to its thinking effort. */
+type ChildEfforts = Map<string, Effort>
 
 /**
  * Deployment-varying choices. Every tunable here is a validated `Config` field
@@ -159,20 +169,56 @@ function extractText(blocks: ContentBlock[]): string {
     .join('')
 }
 
-/** Parse JSON, tolerating a markdown code fence the model may have wrapped it in. */
+/**
+ * Parse JSON from a model's text output, tolerating the common shapes it wraps
+ * the value in: a fenced ```` ```json ```` block, a bare `{...}` / `[...]`
+ * object embedded among prose (fence open but trailing text after it), and a
+ * plain JSON value. Returns `undefined` when nothing parses.
+ */
 function parseJson(text: string): unknown {
   const trimmed = text.trim()
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(trimmed)
-  const candidate = fenced?.[1] ?? trimmed
+  if (trimmed.length === 0) return undefined
+
+  // 1. Whole message is exactly one fenced block.
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```\s*$/iu.exec(trimmed)
+  if (fenced?.[1] !== undefined) {
+    const parsed = parseJson(fenced[1])
+    if (parsed !== undefined) return parsed
+  }
+
+  // 2. First balanced-looking `{...}` or `[...]` run, even with prose around it.
+  const object = /(\{[\s\S]*\}|\[[\s\S]*\])/.exec(trimmed)
+  if (object?.[1] !== undefined) {
+    try {
+      return JSON.parse(object[1])
+    } catch {
+      // fall through to the direct attempt
+    }
+  }
+
+  // 3. The raw message itself.
   try {
-    return JSON.parse(candidate)
+    return JSON.parse(trimmed)
   } catch {
     return undefined
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/**
+ * Sleep for `ms`, resolving early when `signal` aborts so a cancelled pipeline
+ * never idles out the tail of its pacing delay.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve()
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms)
+    function done(): void {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
 }
 
 /** Jitter a delay by ±30% so concurrent tasks never start in lockstep. */
@@ -215,16 +261,19 @@ function topoOrder(tasks: PlanTask[]): PlanTask[] {
 }
 
 /**
- * Start one child on `config.provider` with the given model override.
- * The fixed instruction rides in the per-child `persona` (system position,
- * identical across children → KV-cache reuse); only the dynamic task text goes
- * in the user `prompt`.
+ * Start one child on `config.provider` with the given model and thinking
+ * effort. The fixed instruction rides in the per-child `persona` (system
+ * position, identical across children → KV-cache reuse); only the dynamic task
+ * text goes in the user `prompt`. The child's session id is recorded with its
+ * effort so the `agent/request` waterfall can inject it precisely.
  */
 async function spawn(
   ctx: Context,
   config: Config,
   invocation: CommandInvocation,
   model: string,
+  effort: Effort,
+  childEfforts: ChildEfforts,
   promptText: string,
   personaText: string,
   outputSchema?: ObjectJsonSchema,
@@ -239,16 +288,16 @@ async function spawn(
     maxDepth: config.maxDepth,
     ...(outputSchema === undefined ? {} : { outputSchema }),
   })
-  childSessions.add(run.localAgent?.id ?? run.id)
+  childEfforts.set(run.localAgent?.id ?? run.id, effort)
   return run
 }
 
 /** Await a child's terminal result, always disposing the run afterwards. */
-async function settle(run: SubagentRun): Promise<SubagentResult> {
+async function settle(run: SubagentRun, childEfforts: ChildEfforts): Promise<SubagentResult> {
   try {
     return await run.result
   } finally {
-    childSessions.delete(run.localAgent?.id ?? run.id)
+    childEfforts.delete(run.localAgent?.id ?? run.id)
     await run.dispose()
   }
 }
@@ -307,9 +356,14 @@ async function planPhase(
   config: Config,
   invocation: CommandInvocation,
   task: string,
+  childEfforts: ChildEfforts,
 ): Promise<Plan> {
-  const run = await spawn(ctx, config, invocation, config.plannerModel, plannerPrompt(task), PLANNER_INSTRUCTION, PLAN_SCHEMA)
-  const result = await settle(run)
+  const run = await spawn(
+    ctx, config, invocation,
+    config.plannerModel, config.plannerEffort, childEfforts,
+    plannerPrompt(task), PLANNER_INSTRUCTION, PLAN_SCHEMA,
+  )
+  const result = await settle(run, childEfforts)
   if (result.stopReason !== 'completed') {
     throw new Error(`planner failed: ${result.stopReason}`)
   }
@@ -325,22 +379,40 @@ async function executeOne(
   config: Config,
   invocation: CommandInvocation,
   task: PlanTask,
-  deps: TaskResult[] = [],
+  deps: TaskResult[],
+  childEfforts: ChildEfforts,
 ): Promise<TaskResult> {
-  await sleep(jitteredDelay(config.stepIntervalMs))
+  await sleep(jitteredDelay(config.stepIntervalMs), invocation.signal)
   const flashAttempts = config.maxRetries + 1
   let lastFailure = ''
   for (let attempt = 0; attempt <= flashAttempts; attempt += 1) {
+    // A cancelled invocation aborts the loop immediately — no pointless retries
+    // against a dead signal.
+    if (invocation.signal.aborted) {
+      return { task_id: task.task_id, ok: false, text: '已停止', model: '—' }
+    }
     // Flash for attempts 0..maxRetries, then the planner model as the final fallback.
     const model = attempt < flashAttempts ? config.executorModel : config.plannerModel
+    // The fallback runs on the planner model, so it takes the planner effort.
+    const effort = attempt < flashAttempts ? config.executorEffort : config.plannerEffort
     try {
-      const run = await spawn(ctx, config, invocation, model, executorPrompt(task, deps), EXECUTOR_INSTRUCTION)
-      const result = await settle(run)
+      const run = await spawn(
+        ctx, config, invocation,
+        model, effort, childEfforts,
+        executorPrompt(task, deps), EXECUTOR_INSTRUCTION,
+      )
+      const result = await settle(run, childEfforts)
       if (result.stopReason === 'completed') {
         return { task_id: task.task_id, ok: true, text: extractText(result.output), model }
       }
+      if (result.stopReason === 'aborted') {
+        return { task_id: task.task_id, ok: false, text: '已停止', model }
+      }
       lastFailure = `stopReason=${result.stopReason}`
     } catch (error: unknown) {
+      if (invocation.signal.aborted) {
+        return { task_id: task.task_id, ok: false, text: '已停止', model }
+      }
       lastFailure = error instanceof Error ? error.message : String(error)
     }
   }
@@ -352,6 +424,7 @@ async function executePhase(
   config: Config,
   invocation: CommandInvocation,
   plan: Plan,
+  childEfforts: ChildEfforts,
 ): Promise<TaskResult[]> {
   const ordered = topoOrder(plan.tasks)
   const results = new Array<TaskResult>(ordered.length)
@@ -368,6 +441,8 @@ async function executePhase(
 
   const workers = Array.from({ length: workerCount }, async () => {
     for (;;) {
+      // A cancelled invocation stops the scan — no further tasks are claimed.
+      if (invocation.signal.aborted) break
       // Synchronous scan-and-claim (no `await` inside) so two workers cannot
       // grab the same task; the `stepIntervalMs` jitter still runs inside
       // `executeOne`, preserving the rate-limit ramp.
@@ -385,7 +460,7 @@ async function executePhase(
       const deps: TaskResult[] = (task.depend_on ?? [])
         .map(id => resultById.get(id))
         .filter((result): result is TaskResult => result !== undefined)
-      const result = await executeOne(ctx, config, invocation, task, deps)
+      const result = await executeOne(ctx, config, invocation, task, deps, childEfforts)
       results[index] = result
       resultById.set(task.task_id, result)
       done.add(task.task_id)
@@ -401,9 +476,14 @@ async function reviewPhase(
   invocation: CommandInvocation,
   plan: Plan,
   results: TaskResult[],
+  childEfforts: ChildEfforts,
 ): Promise<ReviewVerdict> {
-  const run = await spawn(ctx, config, invocation, config.reviewerModel, reviewPrompt(plan, results), REVIEW_INSTRUCTION)
-  const result = await settle(run)
+  const run = await spawn(
+    ctx, config, invocation,
+    config.reviewerModel, config.reviewerEffort, childEfforts,
+    reviewPrompt(plan, results), REVIEW_INSTRUCTION,
+  )
+  const result = await settle(run, childEfforts)
   if (result.stopReason !== 'completed') {
     return { pass: false, retryTaskIds: [], problems: [`review failed: ${result.stopReason}`] }
   }
@@ -425,6 +505,7 @@ function renderSummary(plan: Plan, results: TaskResult[], verdict: ReviewVerdict
   const succeeded = results.filter(result => result.ok).length
   const lines: string[] = [`/pe 完成 — 目标：${plan.goal}`, `子任务 ${results.length} 个，成功 ${succeeded} 个`]
   for (const result of results) {
+    if (result === undefined) continue
     lines.push(`\n【${result.task_id}】${result.ok ? '✓' : '✗'}（${result.model}）\n${result.text}`)
   }
   if (verdict !== undefined) {
@@ -472,63 +553,69 @@ async function run(
   ctx: Context,
   config: Config,
   invocation: CommandInvocation,
+  childEfforts: ChildEfforts,
 ): Promise<CommandResult> {
   const task = invocation.rawInput.trim()
   if (task.length === 0) {
     return { kind: 'error', text: 'Usage: /pe <task description>' }
   }
+  const signal = invocation.signal
   try {
-    const plan = await planPhase(ctx, config, invocation, task)
+    const plan = await planPhase(ctx, config, invocation, task, childEfforts)
+    if (signal.aborted) return { kind: 'error', text: '已停止' }
+
     if (config.confirm) {
       const approved = await confirmPlan(ctx, invocation, plan)
       if (!approved) {
         return { kind: 'success', text: '已取消，未执行任何子任务。' }
       }
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
     }
-    let results = await executePhase(ctx, config, invocation, plan)
+
+    let results = await executePhase(ctx, config, invocation, plan, childEfforts)
+    if (signal.aborted) return { kind: 'error', text: '已停止' }
+
     let verdict: ReviewVerdict | undefined
     if (config.review) {
-      verdict = await reviewPhase(ctx, config, invocation, plan, results)
+      verdict = await reviewPhase(ctx, config, invocation, plan, results, childEfforts)
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
       // One bounded re-review pass: re-run only the task ids the reviewer
       // flagged, then re-review once. The single-pass bound prevents loops.
       if (!verdict.pass && verdict.retryTaskIds.length > 0) {
         const retrySet = new Set(verdict.retryTaskIds)
         const retryTasks = plan.tasks.filter(task => retrySet.has(task.task_id))
-        const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks })
+        const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks }, childEfforts)
+        if (signal.aborted) return { kind: 'error', text: '已停止' }
         for (const item of retried) {
           const at = results.findIndex(existing => existing.task_id === item.task_id)
           if (at >= 0) results[at] = item
           else results.push(item)
         }
-        verdict = await reviewPhase(ctx, config, invocation, plan, results)
+        verdict = await reviewPhase(ctx, config, invocation, plan, results, childEfforts)
       }
     }
     return { kind: 'success', text: renderSummary(plan, results, verdict) }
   } catch (error: unknown) {
+    if (signal.aborted) return { kind: 'error', text: '已停止' }
     return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
   }
 }
 
-/** Map one resolved model to its configured thinking effort, or leave it alone. */
-function effortForModel(config: Config, model: string | undefined): Effort | undefined {
-  if (model === undefined) return undefined
-  if (model === config.executorModel) return config.executorEffort
-  if (model === config.reviewerModel) return config.reviewerEffort
-  if (model === config.plannerModel) return config.plannerEffort
-  return undefined
-}
-
 export function apply(ctx: Context, config: Config): void {
+  // Per-instance child-effort map: the ONLY scope the thinking override applies
+  // to. Children spawned by THIS plugin instance get their effort recorded at
+  // spawn and cleared at settle, so ordinary chat and other plugins are never
+  // touched, and a planner/reviewer sharing one model still map to their own
+  // effort level (no model-string guessing).
+  const childEfforts: ChildEfforts = new Map()
+
   // Thinking is adapter-global (`llm-deepseek` `thinking`/`reasoningEffort`)
   // and cannot ride `agentOptions` (provider/model/maxTokens only). Inject it
-  // per request through the `agent/request` waterfall, keyed on the resolved
-  // model — but ONLY for children this plugin spawned (tracked by session id),
-  // so ordinary chat keeps its adapter-default thinking and the conversation
-  // returns to normal once `/pe` finishes.
+  // per request through the `agent/request` waterfall, keyed on the exact child
+  // session id recorded at spawn.
   ctx.on('agent/request', async (payload, next) => {
     const resolved = await next()
-    if (!childSessions.has(payload.agent.id)) return resolved
-    const effort = effortForModel(config, resolved.model)
+    const effort = childEfforts.get(payload.agent.id)
     if (effort === undefined) return resolved
     return { ...resolved, reasoningEffort: effort as ReasoningEffortId }
   })
@@ -537,6 +624,6 @@ export function apply(ctx: Context, config: Config): void {
     name: 'pe',
     description: 'Pro plans, Flash executes, Pro reviews — a rate-limit-friendly Plan-and-Execute pipeline',
     input: { hint: '<task description>' },
-    handler: invocation => run(ctx, config, invocation),
+    handler: invocation => run(ctx, config, invocation, childEfforts),
   })
 }

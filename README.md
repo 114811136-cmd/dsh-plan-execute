@@ -99,11 +99,17 @@ dsh plugin --profile web add ./dsh-plan-execute-0.1.0.tgz
 
 `RequestBurstTooFast` 是瞬时尖峰保护：短间隔重试会越试越糟。Harness 自带 `llm-retry` 已对 429 做指数退避 + jitter 并尊重 `Retry-After`；插件侧用 `maxConcurrency` + `stepIntervalMs` 从源头压低爆发。如需更缓的退避，在 DeepSeek provider 的 `retryPolicy.backoff` 上调大 `initialDelayMs`（1000–2000）与 `maxDelayMs`（≤16000），`jitterRatio` 0.2–0.5。不要写死固定重试延迟。
 
-## thinking 控制（已实现，注意副作用）
+## thinking 控制（已实现，无副作用）
 
-thinking 是 `llm-deepseek` 适配器的**全局默认**，`agentOptions` 带不了。本插件通过 `agent/request` 瀑布按 model 注入 `reasoningEffort`：Flash→`off`、Pro→`high`。
+thinking 是 `llm-deepseek` 适配器的**全局默认**，`agentOptions` 带不了。本插件通过 `agent/request` 瀑布按**子代理 session id** 注入 `reasoningEffort`：规划→`plannerEffort`、执行→`executorEffort`、复核→`reviewerEffort`。
 
-**副作用**：任何用 `deepseek-v4-flash` 的请求（包括普通聊天）都会变为 thinking-off；用 `deepseek-v4-pro` 的会变为 `high`。这符合省钱目标（Flash 思考无增益），但如果你希望普通聊天保持原样，删掉 `apply()` 里的 `agent/request` 监听即可，代价是子代理统一继承适配器默认 thinking。
+**注入范围严格限定**：每次 `spawn` 时把子代理 id 与对应 effort 记入 per-instance 的 Map，`settle` 时清除。因此：
+- 普通聊天、其他插件**完全不受影响**（不再是按 model 字符串全局改写）
+- 规划/复核即使共用同一模型（默认都是 `deepseek-v4-pro`），也能各自拿到 `plannerEffort` / `reviewerEffort` 的独立取值
+
+## 停止（中断）
+
+执行任何阶段都可以停止：GUI 输入框的「停止生成」按钮会 abort 本次命令的 `AbortSignal`，插件在**每个阶段、每个 worker 扫描、每次 Flash 重试**前都检查该信号，立即退出并返回「已停止」。不会出现点了停止还要等它跑完剩余子任务的情况。
 
 ## 迁移到新电脑（无账号）
 
