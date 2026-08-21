@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<your-user>/dsh-plan-execute.git"
+    "url": "git+https://github.com/114811136-cmd/dsh-plan-execute.git"
   },
   "type": "module",
   "main": "lib/index.js",

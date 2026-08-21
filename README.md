@@ -38,7 +38,7 @@ git push
 其他电脑更新：
 
 ```sh
-dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute
+dsh plugin --profile web add github:114811136-cmd/dsh-plan-execute
 ```
 
 > 构建说明：`pnpm build` 用 esbuild 把 `src/index.ts` 转译为 `lib/index.js`，`@deepseek-ai/*` 全部 external（运行时由 dsh 提供）。**不跑类型检查**——`@deepseek-ai/*` 的类型定义只在 dsh 源码 checkout 里有，独立仓库没有；需要类型检查时在 dsh checkout 里对 `src/index.ts` 跑 `tsc`。
@@ -51,7 +51,7 @@ dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute
 
 ```sh
 # 新电脑装好同版本 dsh 后，一条命令即可（lib/ 已提交，无需构建授权）：
-dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute
+dsh plugin --profile web add github:114811136-cmd/dsh-plan-execute
 # 重启或热载入 web 后，聊天框斜杠菜单出现 /pe
 ```
 
@@ -119,7 +119,7 @@ thinking 是 `llm-deepseek` 适配器的**全局默认**，`agentOptions` 带不
 git add -A && git commit -m "..." && git push
 ```
 
-目标电脑重跑 `dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute`（或更新已装的 git 依赖）即可获取新版本。
+目标电脑重跑 `dsh plugin --profile web add github:114811136-cmd/dsh-plan-execute`（或更新已装的 git 依赖）即可获取新版本。
 
 ## 实现前必做的 3 项核对（本骨架未伪造的部分）
 
