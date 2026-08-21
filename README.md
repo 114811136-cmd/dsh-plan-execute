@@ -18,6 +18,33 @@
 2. **执行**：`deepseek-v4-flash` 子代理逐个执行；受 `maxConcurrency` 与 `stepIntervalMs` 约束，Flash 重试 `maxRetries` 次后改 Pro 兜底。
 3. **复核**：`deepseek-v4-pro` 子代理校验产出；可关（`review: false`）。
 
+## 开发与更新插件功能
+
+改 `src/index.ts`，然后重新编译、提交、推送：
+
+```sh
+# 1. 首次开发前装依赖（只需一次）
+pnpm install
+
+# 2. 改完代码后编译（esbuild 转译 src → lib/index.js）
+pnpm build
+
+# 3. 提交并推送（lib/ 产物一并提交）
+git add -A
+git commit -m "feat: ..."
+git push
+```
+
+其他电脑更新：
+
+```sh
+dsh plugin --profile web add github:<你的用户名>/dsh-plan-execute
+```
+
+> 构建说明：`pnpm build` 用 esbuild 把 `src/index.ts` 转译为 `lib/index.js`，`@deepseek-ai/*` 全部 external（运行时由 dsh 提供）。**不跑类型检查**——`@deepseek-ai/*` 的类型定义只在 dsh 源码 checkout 里有，独立仓库没有；需要类型检查时在 dsh checkout 里对 `src/index.ts` 跑 `tsc`。
+>
+> 唯一运行时依赖 `@deepseek-ai/schemastery` 已声明在 `dependencies`（npm 上有发布），因此独立仓库可自包含解析。
+
 ## 安装
 
 ### 从 GitHub 安装（推荐，跨电脑一条命令）

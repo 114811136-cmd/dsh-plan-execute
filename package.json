@@ -22,14 +22,20 @@
     "cordis.patch.yml"
   ],
   "license": "MIT",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=node --target=node20 --external:@deepseek-ai/* --outfile=lib/index.js",
+    "pack": "pnpm pack"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=0.1.0",
-    "@deepseek-ai/schemastery": ">=0.1.0",
     "@deepseek-ai/dsh-agent": ">=0.1.0",
     "@deepseek-ai/dsh-commands": ">=0.1.0",
     "@deepseek-ai/dsh-llm": ">=0.1.0",
@@ -38,13 +44,6 @@
     "@deepseek-ai/dsh-user-questions": ">=0.1.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": ">=0.1.0",
-    "@deepseek-ai/schemastery": ">=0.1.0",
-    "@deepseek-ai/dsh-agent": ">=0.1.0",
-    "@deepseek-ai/dsh-commands": ">=0.1.0",
-    "@deepseek-ai/dsh-llm": ">=0.1.0",
-    "@deepseek-ai/dsh-subagent": ">=0.1.0",
-    "@deepseek-ai/dsh-tools": ">=0.1.0",
-    "@deepseek-ai/dsh-user-questions": ">=0.1.0"
+    "esbuild": "^0.28.1"
   }
 }
