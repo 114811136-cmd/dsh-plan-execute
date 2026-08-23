@@ -84,6 +84,8 @@ export interface Config {
   /** Hard per-attempt timeout for one executor child (ms). A stuck child is
    *  aborted after this and retried, never waited on forever. */
   executorTimeoutMs: number
+  /** Max interactive fix rounds when subtasks fail or review rejects. */
+  maxFixRounds: number
 }
 
 export const Config: z<Config> = z.object({
@@ -102,6 +104,7 @@ export const Config: z<Config> = z.object({
   reviewerEffort: z.union(['off', 'low', 'high', 'max'] as const).default('high'),
   maxDepth: z.number().step(1).min(0).max(8).default(3),
   executorTimeoutMs: z.number().step(1).min(10000).max(600000).default(120000),
+  maxFixRounds: z.number().step(1).min(0).max(5).default(2),
 })
 
 /**
@@ -152,6 +155,8 @@ interface TaskResult {
   ok: boolean
   text: string
   model: string
+  /** Wall-clock duration of the task's whole attempt series, ms. */
+  elapsedMs?: number
 }
 
 interface ReviewVerdict {
@@ -281,9 +286,10 @@ async function spawn(
   promptText: string,
   personaText: string,
   outputSchema?: ObjectJsonSchema,
+  labelSuffix?: string,
 ): Promise<SubagentRun> {
   const run = await ctx.subagents.start(config.provider, {
-    label: `pe:${model}`,
+    label: `pe:${model}${labelSuffix === undefined ? '' : `·${labelSuffix}`}`,
     persona: personaText,
     prompt: [textBlock(promptText)],
     parent: invocation.agent,
@@ -436,11 +442,12 @@ async function executeOne(
   await sleep(jitteredDelay(config.stepIntervalMs), invocation.signal)
   const flashAttempts = config.maxRetries + 1
   let lastFailure = ''
+  const taskStart = Date.now()
   for (let attempt = 0; attempt <= flashAttempts; attempt += 1) {
     // A cancelled invocation aborts the loop immediately — no pointless retries
     // against a dead signal.
     if (invocation.signal.aborted) {
-      return { task_id: task.task_id, ok: false, text: '已停止', model: '—' }
+      return { task_id: task.task_id, ok: false, text: '已停止', model: '—', elapsedMs: Date.now() - taskStart }
     }
     // Flash for attempts 0..maxRetries, then the planner model as the final fallback.
     const model = attempt < flashAttempts ? config.executorModel : config.plannerModel
@@ -451,13 +458,14 @@ async function executeOne(
         ctx, config, invocation,
         model, effort, childEfforts,
         executorPrompt(task, deps), EXECUTOR_INSTRUCTION,
+        undefined, task.task_id,
       )
       const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
       if (result.stopReason === 'completed') {
-        return { task_id: task.task_id, ok: true, text: extractText(result.output), model }
+        return { task_id: task.task_id, ok: true, text: extractText(result.output), model, elapsedMs: Date.now() - taskStart }
       }
       if (invocation.signal.aborted) {
-        return { task_id: task.task_id, ok: false, text: '已停止', model }
+        return { task_id: task.task_id, ok: false, text: '已停止', model, elapsedMs: Date.now() - taskStart }
       }
       // 超时 → 可重试的第一级兜底；基础设施故障保留原始错误。
       if (result.timedOut) {
@@ -469,13 +477,13 @@ async function executeOne(
       }
     } catch (error: unknown) {
       if (invocation.signal.aborted) {
-        return { task_id: task.task_id, ok: false, text: '已停止', model }
+        return { task_id: task.task_id, ok: false, text: '已停止', model, elapsedMs: Date.now() - taskStart }
       }
       lastFailure = error instanceof Error ? error.message : String(error)
     }
   }
   // 所有尝试（Flash 重试 + Pro 兜底）都失败/超时 → 明确失败，绝不卡住。
-  return { task_id: task.task_id, ok: false, text: lastFailure, model: config.plannerModel }
+  return { task_id: task.task_id, ok: false, text: lastFailure, model: config.plannerModel, elapsedMs: Date.now() - taskStart }
 }
 
 async function executePhase(
@@ -574,10 +582,15 @@ async function reviewPhase(
 
 function renderSummary(plan: Plan, results: TaskResult[], verdict: ReviewVerdict | undefined): string {
   const succeeded = results.filter(result => result !== undefined && result.ok).length
-  const lines: string[] = [`/pe 完成 — 目标：${plan.goal}`, `子任务 ${results.length} 个，成功 ${succeeded} 个`]
+  const totalMs = results.reduce((sum, r) => sum + (r?.elapsedMs ?? 0), 0)
+  const lines: string[] = [
+    `/pe 完成 — 目标：${plan.goal}`,
+    `子任务 ${results.length} 个，成功 ${succeeded} 个，总耗时 ${(totalMs / 1000).toFixed(1)}s`,
+  ]
   for (const result of results) {
     if (result === undefined) continue
-    lines.push(`\n【${result.task_id}】${result.ok ? '✓' : '✗'}（${result.model}）\n${result.text}`)
+    const elapsed = result.elapsedMs !== undefined ? `（${(result.elapsedMs / 1000).toFixed(1)}s）` : ''
+    lines.push(`\n【${result.task_id}】${result.ok ? '✓' : '✗'}${elapsed}（${result.model}）\n${result.text}`)
   }
   if (verdict !== undefined) {
     lines.push(`\n复核：${verdict.pass ? '通过' : `未通过 — ${verdict.problems.join('；')}`}`)
@@ -618,6 +631,66 @@ async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Pl
   })
   const selected = answer.answers.find(item => item.id === 'pe_confirm')?.selected ?? []
   return selected.includes('执行')
+}
+
+/** One failed subtask, rendered for the fix prompt. */
+interface FailedTaskInfo {
+  task_id: string
+  description: string
+  reason: string
+}
+
+/**
+ * 失败交互：子任务失败或复核不通过时，停下来让用户决定怎么处理。
+ * @returns the user's decision; `modifyText` carries the user's written fix
+ *   requirement when the action is `modify`.
+ */
+async function askFixStrategy(
+  ctx: Context,
+  invocation: CommandInvocation,
+  failed: FailedTaskInfo[],
+  problems: string[],
+): Promise<{ action: 'modify' | 'retry' | 'accept' | 'abort'; modifyText: string }> {
+  const detailLines = failed.map(f => `- ${f.task_id} ${f.description}\n  （${f.reason}）`)
+  const problemLine = problems.length > 0 ? `\n复核问题：${problems.join('；')}` : ''
+  const answer = await ctx.userQuestions.ask({
+    questions: [{
+      id: 'pe_fix',
+      question: '部分子任务未通过，如何处理？',
+      detail: `失败任务：\n${detailLines.join('\n')}${problemLine}\n\n若选「修改后重跑」，请在下方填写修改要求（如改哪里、怎么改）。`,
+      options: [
+        { label: '修改后重跑', description: '按你的修改要求重新执行失败任务' },
+        { label: '直接重跑', description: '不改动，重新执行失败任务' },
+        { label: '接受结果', description: '保留当前结果（含失败），结束本次 /pe' },
+        { label: '终止', description: '停止本次 /pe，不重跑' },
+      ],
+    }],
+    agent: invocation.agent,
+    signal: invocation.signal,
+  })
+  const item = answer.answers.find(entry => entry.id === 'pe_fix')
+  const selected = item?.selected ?? []
+  const custom = item?.custom?.trim() ?? ''
+  if (selected.includes('修改后重跑')) {
+    return { action: 'modify', modifyText: custom.length > 0 ? custom : '请按上述失败原因修正后重跑。' }
+  }
+  if (selected.includes('直接重跑')) return { action: 'retry', modifyText: '' }
+  if (selected.includes('接受结果')) return { action: 'accept', modifyText: '' }
+  // 未选任何已知项 → 视为终止，绝不擅自重跑。
+  return { action: 'abort', modifyText: '' }
+}
+
+/** Collect the failed subtasks with their plan description and failure reason. */
+function collectFailed(results: TaskResult[], plan: Plan): FailedTaskInfo[] {
+  const byId = new Map(plan.tasks.map(task => [task.task_id, task]))
+  const failed: FailedTaskInfo[] = []
+  for (const result of results) {
+    if (result === undefined || result.ok) continue
+    const description = byId.get(result.task_id)?.description ?? ''
+    const reason = result.text.length > 120 ? `${result.text.slice(0, 120)}…` : result.text
+    failed.push({ task_id: result.task_id, description, reason })
+  }
+  return failed
 }
 
 /**
@@ -693,19 +766,44 @@ async function run(
     if (config.review) {
       verdict = await reviewPhase(ctx, config, invocation, plan, results, childEfforts)
       if (signal.aborted) return { kind: 'error', text: '已停止' }
-      // One bounded re-review pass: re-run only the task ids the reviewer
-      // flagged, then re-review once. The single-pass bound prevents loops.
-      if (!verdict.pass && verdict.retryTaskIds.length > 0) {
-        const retrySet = new Set(verdict.retryTaskIds)
-        const retryTasks = plan.tasks.filter(task => retrySet.has(task.task_id))
-        const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks }, childEfforts)
-        if (signal.aborted) return { kind: 'error', text: '已停止' }
-        for (const item of retried) {
-          const at = results.findIndex(existing => existing.task_id === item.task_id)
-          if (at >= 0) results[at] = item
-          else results.push(item)
-        }
+    }
+
+    // 失败交互：子任务失败或复核不通过时，停下来问用户怎么处理，
+    // 而不是自动重跑一次就结束。最多 maxFixRounds 轮，且必须用户确认。
+    for (let round = 0; round < config.maxFixRounds; round += 1) {
+      const failed = collectFailed(results, plan)
+      const needsFix = failed.length > 0 || (verdict !== undefined && !verdict.pass)
+      if (!needsFix) break
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
+
+      const decision = await askFixStrategy(ctx, invocation, failed, verdict?.problems ?? [])
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
+      if (decision.action === 'abort') {
+        return { kind: 'success', text: '已终止，未继续重跑。' }
+      }
+      if (decision.action === 'accept') break
+
+      // retry 或 modify：重跑全部失败/复核标记的任务。
+      const retryIds = new Set(failed.map(f => f.task_id))
+      for (const id of verdict?.retryTaskIds ?? []) retryIds.add(id)
+      const modifyText = decision.action === 'modify' ? decision.modifyText : ''
+      const retryTasks = plan.tasks
+        .filter(task => retryIds.has(task.task_id))
+        .map(task => modifyText.length > 0
+          ? { ...task, description: `${task.description}\n【用户修改要求】${modifyText}` }
+          : task)
+      if (retryTasks.length === 0) break
+
+      const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks }, childEfforts)
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
+      for (const item of retried) {
+        const at = results.findIndex(existing => existing.task_id === item.task_id)
+        if (at >= 0) results[at] = item
+        else results.push(item)
+      }
+      if (config.review) {
         verdict = await reviewPhase(ctx, config, invocation, plan, results, childEfforts)
+        if (signal.aborted) return { kind: 'error', text: '已停止' }
       }
     }
     return { kind: 'success', text: renderSummary(plan, results, verdict) }
