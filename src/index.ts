@@ -81,6 +81,9 @@ export interface Config {
   reviewerEffort: Effort
   /** Delegation-depth cap passed to every child. */
   maxDepth: number
+  /** Hard per-attempt timeout for one executor child (ms). A stuck child is
+   *  aborted after this and retried, never waited on forever. */
+  executorTimeoutMs: number
 }
 
 export const Config: z<Config> = z.object({
@@ -98,6 +101,7 @@ export const Config: z<Config> = z.object({
   executorEffort: z.union(['off', 'low', 'high', 'max'] as const).default('off'),
   reviewerEffort: z.union(['off', 'low', 'high', 'max'] as const).default('high'),
   maxDepth: z.number().step(1).min(0).max(8).default(3),
+  executorTimeoutMs: z.number().step(1).min(10000).max(600000).default(120000),
 })
 
 /**
@@ -292,7 +296,51 @@ async function spawn(
   return run
 }
 
-/** Await a child's terminal result, always disposing the run afterwards. */
+/** Signals a per-attempt executor timeout (distinct from a child fault). */
+class ExecutorTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`子任务超时（${Math.round(timeoutMs / 1000)}s）`)
+    this.name = 'ExecutorTimeoutError'
+  }
+}
+
+/**
+ * Await a child's result with a hard per-attempt timeout. On expiry the run is
+ * disposed — which cancels the child's remaining work and reaches quiescence —
+ * and the attempt fails with a timeout message the caller can retry. A
+ * child-level infrastructure fault (a `run.result` rejection the seam cannot
+ * represent as a stop reason) is preserved as `stopReason: 'error'`, never
+ * misread as a timeout.
+ */
+async function settleWithTimeout(
+  run: SubagentRun,
+  childEfforts: ChildEfforts,
+  timeoutMs: number,
+): Promise<{ stopReason: SubagentResult['stopReason']; output: ContentBlock[]; timedOut: boolean; fault?: unknown }> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    const result = await Promise.race([
+      run.result,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new ExecutorTimeoutError(timeoutMs)), timeoutMs)
+      }),
+    ])
+    return { stopReason: result.stopReason, output: result.output, timedOut: false }
+  } catch (error: unknown) {
+    if (error instanceof ExecutorTimeoutError) {
+      return { stopReason: 'aborted', output: [], timedOut: true }
+    }
+    // run.result rejected: an infrastructure fault, not a child-level failure.
+    return { stopReason: 'error', output: [], timedOut: false, fault: error }
+  } finally {
+    clearTimeout(timer)
+    childEfforts.delete(run.localAgent?.id ?? run.id)
+    // Cancel any remaining child work on both the timeout and early-return paths.
+    await run.dispose()
+  }
+}
+
+/** Await a child's terminal result without a timeout, always disposing afterwards. */
 async function settle(run: SubagentRun, childEfforts: ChildEfforts): Promise<SubagentResult> {
   try {
     return await run.result
@@ -310,7 +358,7 @@ const PLANNER_INSTRUCTION = [
   '你是任务规划器。把下面的用户需求拆解为可独立执行的子任务，输出严格 JSON，禁止任何额外解释或 markdown 代码块。',
   '结构：{"goal":"整体目标","constraints":["约束"],"tasks":[{"task_id":"T001","description":"足够明确的单步指令","output_format":"text|json|markdown","depend_on":[]}]}',
   '规则：一个子任务只做一件事；depend_on 填依赖的 task_id；不要生成模糊指令。',
-  '澄清：若用户需求在关键点上不明确（目标路径、文件名、输入/输出格式、验收标准、技术栈等），先用 ask_user_question 工具一次性提出不超过 5 个最关键的问题（每个带稳定 id），收到用户回答后再基于回答输出最终计划 JSON；若需求已足够明确，直接输出计划，不要为了问而问。',
+  '澄清（强制）：你的首要任务是确认目标，不是猜测目标。若用户需求在关键点上不明确（目标路径、文件名、输入/输出格式、验收标准、技术栈等），你必须先用 ask_user_question 工具提出不超过 5 个最关键的问题（每个带稳定 id），收到用户回答后才允许输出计划 JSON。禁止在信息不足时靠猜测输出计划；宁可多问，不可臆测。',
 ].join('\n')
 
 const EXECUTOR_INSTRUCTION = [
@@ -371,6 +419,9 @@ async function planPhase(
   if (plan === undefined || !Array.isArray(plan.tasks) || typeof plan.goal !== 'string') {
     throw new Error('planner returned no parseable plan')
   }
+  if (plan.tasks.length === 0) {
+    throw new Error('planner returned an empty task list')
+  }
   return plan
 }
 
@@ -401,14 +452,21 @@ async function executeOne(
         model, effort, childEfforts,
         executorPrompt(task, deps), EXECUTOR_INSTRUCTION,
       )
-      const result = await settle(run, childEfforts)
+      const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
       if (result.stopReason === 'completed') {
         return { task_id: task.task_id, ok: true, text: extractText(result.output), model }
       }
-      if (result.stopReason === 'aborted') {
+      if (invocation.signal.aborted) {
         return { task_id: task.task_id, ok: false, text: '已停止', model }
       }
-      lastFailure = `stopReason=${result.stopReason}`
+      // 超时 → 可重试的第一级兜底；基础设施故障保留原始错误。
+      if (result.timedOut) {
+        lastFailure = `超时（${Math.round(config.executorTimeoutMs / 1000)}s）`
+      } else if (result.fault !== undefined) {
+        lastFailure = result.fault instanceof Error ? result.fault.message : String(result.fault)
+      } else {
+        lastFailure = `stopReason=${result.stopReason}`
+      }
     } catch (error: unknown) {
       if (invocation.signal.aborted) {
         return { task_id: task.task_id, ok: false, text: '已停止', model }
@@ -416,6 +474,7 @@ async function executeOne(
       lastFailure = error instanceof Error ? error.message : String(error)
     }
   }
+  // 所有尝试（Flash 重试 + Pro 兜底）都失败/超时 → 明确失败，绝不卡住。
   return { task_id: task.task_id, ok: false, text: lastFailure, model: config.plannerModel }
 }
 
@@ -451,6 +510,18 @@ async function executePhase(
         const candidate = ordered[i]
         if (candidate === undefined || dispatched.has(candidate.task_id)) continue
         if (isReady(candidate)) { index = i; break }
+      }
+      if (index < 0) {
+        // No ready task yet undispatched work remains: the plan contains a
+        // dependency cycle (or a chain that can never resolve). Claim the first
+        // undispatched task and run it with whatever upstream results exist so
+        // the cycle can never deadlock or silently drop tasks.
+        for (let i = 0; i < ordered.length; i += 1) {
+          const candidate = ordered[i]
+          if (candidate === undefined || dispatched.has(candidate.task_id)) continue
+          index = i
+          break
+        }
       }
       if (index < 0) break
       const task = ordered[index]
@@ -502,7 +573,7 @@ async function reviewPhase(
 }
 
 function renderSummary(plan: Plan, results: TaskResult[], verdict: ReviewVerdict | undefined): string {
-  const succeeded = results.filter(result => result.ok).length
+  const succeeded = results.filter(result => result !== undefined && result.ok).length
   const lines: string[] = [`/pe 完成 — 目标：${plan.goal}`, `子任务 ${results.length} 个，成功 ${succeeded} 个`]
   for (const result of results) {
     if (result === undefined) continue
@@ -549,6 +620,45 @@ async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Pl
   return selected.includes('执行')
 }
 
+/**
+ * 强制目标确认：在规划之前，先把对目标的理解摆给用户，必须得到
+ * 明确确认（或补充说明）才继续。信息不足时绝不猜测。
+ */
+async function clarifyGoal(
+  ctx: Context,
+  invocation: CommandInvocation,
+  task: string,
+): Promise<string> {
+  // 复述理解，让用户确认或补充
+  const answer = await ctx.userQuestions.ask({
+    questions: [{
+      id: 'pe_goal',
+      question: '请确认我对你目标的理解，确认后才开始规划执行：',
+      detail: `你输入的原始需求：\n> ${task}\n\n若理解有偏差或需要补充细节（目标路径、输出格式、验收标准、技术栈、优先级等），请直接补充说明；确认无误则选「目标已明确，继续」。`,
+      options: [
+        { label: '目标已明确，继续', description: '按上述理解开始规划' },
+        { label: '目标理解有误', description: '不继续；请补充说明或取消后重新发送 /pe' },
+      ],
+    }],
+    agent: invocation.agent,
+    signal: invocation.signal,
+  })
+  const item = answer.answers.find(entry => entry.id === 'pe_goal')
+  const selected = item?.selected ?? []
+  const custom = item?.custom?.trim() ?? ''
+
+  // 用户明确确认理解无误 → 用原始需求继续
+  if (selected.includes('目标已明确，继续')) {
+    return task
+  }
+  // 用户填了补充说明 → 把补充内容并入需求（无论选了哪个选项都尊重补充）
+  if (custom.length > 0) {
+    return `${task}\n\n【用户补充】${custom}`
+  }
+  // 没有确认也没有补充 → 信息不足，禁止猜测继续
+  throw new Error('目标未确认：请重新发送 /pe 并给出更清晰的目标。')
+}
+
 async function run(
   ctx: Context,
   config: Config,
@@ -561,7 +671,11 @@ async function run(
   }
   const signal = invocation.signal
   try {
-    const plan = await planPhase(ctx, config, invocation, task, childEfforts)
+    // 强制目标确认：必须先明确理解目标，才允许进入规划
+    const clarified = await clarifyGoal(ctx, invocation, task)
+    if (signal.aborted) return { kind: 'error', text: '已停止' }
+
+    const plan = await planPhase(ctx, config, invocation, clarified, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
