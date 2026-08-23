@@ -38,6 +38,8 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type { SubagentRun, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-user-questions'
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 
 export const name = 'plan-execute'
 export const inject = ['commands', 'subagents', 'userQuestions']
@@ -137,6 +139,7 @@ const PLAN_SCHEMA: ObjectJsonSchema = {
           description: { type: 'string' },
           output_format: { type: 'string' },
           depend_on: { type: 'array', items: { type: 'string' } },
+          files: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -148,6 +151,8 @@ interface PlanTask {
   description: string
   output_format?: string
   depend_on?: string[]
+  /** Files this task will create or modify (declared by the planner). */
+  files?: string[]
 }
 
 interface Plan {
@@ -169,6 +174,75 @@ interface ReviewVerdict {
   pass: boolean
   retryTaskIds: string[]
   problems: string[]
+}
+
+/**
+ * Persisted project state for cross-/pe incremental iteration. Records the
+ * goal and the module list (task ↔ files), so a later /pe can plan only the
+ * affected modules instead of redoing everything.
+ */
+interface ProjectState {
+  goal: string
+  modules: Array<{ task_id: string; description: string; files: string[] }>
+}
+
+/** Archive filename inside the workspace root. */
+const STATE_FILENAME = '.pe-plan.json'
+
+function statePath(cwd: string): string {
+  return join(cwd, STATE_FILENAME)
+}
+
+/** Read the persisted project state; undefined when absent or unreadable. */
+async function readState(cwd: string): Promise<ProjectState | undefined> {
+  try {
+    const raw = await readFile(statePath(cwd), 'utf8')
+    const parsed = JSON.parse(raw) as ProjectState
+    if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.modules)) {
+      return undefined
+    }
+    return parsed
+  } catch {
+    return undefined
+  }
+}
+
+/** Write the project state; failure is non-fatal (never breaks the pipeline). */
+async function writeState(cwd: string, state: ProjectState): Promise<void> {
+  try {
+    await writeFile(statePath(cwd), JSON.stringify(state, null, 2), 'utf8')
+  } catch {
+    // Non-fatal: an archive write failure must not fail the whole /pe.
+  }
+}
+
+/**
+ * Merge the just-planned tasks into the previous state. A new task whose
+ * `files` intersect an existing module's files is treated as a revision of
+ * that module (overwrite); otherwise it is appended as a new module.
+ */
+function mergeState(old: ProjectState | undefined, plan: Plan): ProjectState {
+  const modules = (old?.modules ?? []).map(module => ({ ...module }))
+  for (const task of plan.tasks) {
+    const files = task.files ?? []
+    const idx = modules.findIndex(module => module.files.some(file => files.includes(file)))
+    if (idx >= 0) {
+      modules[idx] = { task_id: task.task_id, description: task.description, files }
+    } else {
+      modules.push({ task_id: task.task_id, description: task.description, files })
+    }
+  }
+  return { goal: plan.goal, modules }
+}
+
+/** Render the persisted state as planner prompt context. */
+function renderStatePrompt(state: ProjectState): string {
+  const lines: string[] = [`现有项目：${state.goal}`, '已完成模块：']
+  for (const module of state.modules) {
+    const files = module.files.length > 0 ? ` → ${module.files.join(', ')}` : ''
+    lines.push(`- ${module.task_id} ${module.description}${files}`)
+  }
+  return lines.join('\n')
 }
 
 /** One durable text block for a child's user message. */
@@ -384,8 +458,10 @@ const CLARIFY_INSTRUCTION = [
 
 const PLANNER_INSTRUCTION = [
   '你是任务规划器。把下面的用户需求拆解为可独立执行的子任务，输出严格 JSON，禁止任何额外解释或 markdown 代码块。',
-  '结构：{"goal":"整体目标","constraints":["约束"],"tasks":[{"task_id":"T001","description":"足够明确的单步指令","output_format":"text|json|markdown","depend_on":[]}]}',
+  '结构：{"goal":"整体目标","constraints":["约束"],"tasks":[{"task_id":"T001","description":"足够明确的单步指令","output_format":"text|json|markdown","depend_on":[],"files":["涉及的文件路径"]}]}',
   '规则：一个子任务只做一件事；depend_on 填依赖的 task_id；不要生成模糊指令。',
+  '每个子任务必须用 files 字段声明它将要创建或修改的文件路径（相对工作区），这是后续增量迭代的关键依据，不能省略。',
+  '若需求里给出了「现有项目现状」（已有模块及文件清单），你必须只拆本次需求相关的新任务或修改任务；已完成的模块不要重复拆解，只在其需要被修改时才列入，并在 files 里指向对应文件。',
   '注意：用户需求已经过澄清确认，直接拆解即可，不要向用户提问；若仍有无法确定的关键点，把它写进 constraints 作为假设条件，并在任务中做出合理默认。',
 ].join('\n')
 
@@ -878,7 +954,15 @@ async function run(
     const clarification = await clarifyPhase(ctx, config, invocation, task, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
-    const plan = await planPhase(ctx, config, invocation, clarification.summary, childEfforts)
+    // 增量迭代：读取工作区已有的项目档案，注入规划器作为"现状"，
+    // 让规划器只拆本次需求相关的新/改任务，不重做已完成模块。
+    const cwd = invocation.agent.session.header.cwd
+    const priorState = cwd === undefined ? undefined : await readState(cwd)
+    const planInput = priorState === undefined
+      ? clarification.summary
+      : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${clarification.summary}`
+
+    const plan = await planPhase(ctx, config, invocation, planInput, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
@@ -938,6 +1022,10 @@ async function run(
         verdict = await reviewPhase(ctx, config, invocation, plan, results, childEfforts)
         if (signal.aborted) return { kind: 'error', text: '已停止' }
       }
+    }
+    // 完工后写项目档案，供下次 /pe 增量迭代（加/改功能时只动受影响模块）。
+    if (cwd !== undefined) {
+      await writeState(cwd, mergeState(priorState, plan))
     }
     return { kind: 'success', text: renderSummary(plan, results, verdict) }
   } catch (error: unknown) {
