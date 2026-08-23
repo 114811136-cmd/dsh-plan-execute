@@ -274,7 +274,7 @@ function textBlock(text: string): ContentBlock {
 }
 
 /** Join the text blocks of a child's final output. */
-function extractText(blocks: ContentBlock[]): string {
+function extractText(blocks: readonly ContentBlock[]): string {
   return blocks
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map(block => block.text)
@@ -442,7 +442,7 @@ async function settleWithTimeout(
   run: SubagentRun,
   childEfforts: ChildEfforts,
   timeoutMs: number,
-): Promise<{ stopReason: SubagentResult['stopReason']; output: ContentBlock[]; timedOut: boolean; fault?: unknown }> {
+): Promise<SubagentResult & { timedOut: boolean; fault?: unknown }> {
   let timer: NodeJS.Timeout | undefined
   try {
     const result = await Promise.race([
@@ -451,27 +451,17 @@ async function settleWithTimeout(
         timer = setTimeout(() => reject(new ExecutorTimeoutError(timeoutMs)), timeoutMs)
       }),
     ])
-    return { stopReason: result.stopReason, output: result.output, timedOut: false }
+    return { ...result, timedOut: false }
   } catch (error: unknown) {
     if (error instanceof ExecutorTimeoutError) {
-      return { stopReason: 'aborted', output: [], timedOut: true }
+      return { stopReason: 'aborted', output: [], timedOut: true } as SubagentResult & { timedOut: true }
     }
     // run.result rejected: an infrastructure fault, not a child-level failure.
-    return { stopReason: 'error', output: [], timedOut: false, fault: error }
+    return { stopReason: 'error', output: [], timedOut: false, fault: error } as SubagentResult & { timedOut: false; fault: unknown }
   } finally {
     clearTimeout(timer)
     childEfforts.delete(run.localAgent?.id ?? run.id)
     // Cancel any remaining child work on both the timeout and early-return paths.
-    await run.dispose()
-  }
-}
-
-/** Await a child's terminal result without a timeout, always disposing afterwards. */
-async function settle(run: SubagentRun, childEfforts: ChildEfforts): Promise<SubagentResult> {
-  try {
-    return await run.result
-  } finally {
-    childEfforts.delete(run.localAgent?.id ?? run.id)
     await run.dispose()
   }
 }
@@ -539,9 +529,9 @@ async function planPhase(
     config.plannerModel, config.plannerEffort, childEfforts,
     plannerPrompt(task), PLANNER_INSTRUCTION, PLAN_SCHEMA,
   )
-  const result = await settle(run, childEfforts)
-  if (result.stopReason !== 'completed') {
-    throw new Error(`planner failed: ${result.stopReason}`)
+  const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
+  if (result.stopReason !== 'completed' || result.timedOut) {
+    throw new Error(`planner failed: ${result.stopReason}${result.timedOut ? `（超时 ${Math.round(config.executorTimeoutMs / 1000)}s）` : ''}`)
   }
   const plan = (result.structured ?? parseJson(extractText(result.output))) as Plan | undefined
   if (plan === undefined || !Array.isArray(plan.tasks) || typeof plan.goal !== 'string') {
@@ -684,8 +674,8 @@ async function reviewPhase(
     config.reviewerModel, config.reviewerEffort, childEfforts,
     reviewPrompt(plan, results), REVIEW_INSTRUCTION,
   )
-  const result = await settle(run, childEfforts)
-  if (result.stopReason !== 'completed') {
+  const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
+  if (result.stopReason !== 'completed' || result.timedOut) {
     return { pass: false, retryTaskIds: [], problems: [`review failed: ${result.stopReason}`] }
   }
   const raw = parseJson(extractText(result.output)) as Record<string, unknown> | undefined
@@ -872,8 +862,8 @@ async function diagnoseFix(
     config.plannerModel, config.clarifyEffort, childEfforts,
     prompt, FIX_INSTRUCTION, FIX_SCHEMA, 'fix-diagnose',
   )
-  const result = await settle(run, childEfforts)
-  if (result.stopReason !== 'completed') {
+  const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
+  if (result.stopReason !== 'completed' || result.timedOut) {
     return { tasks: [] }
   }
   const raw = (result.structured ?? parseJson(extractText(result.output))) as FixPlan | undefined

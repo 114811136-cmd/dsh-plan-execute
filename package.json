@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-plan-execute",
   "description": "Slash command /pe: Pro-plan 闂?Flash-execute 闂?Pro-review over the subagent seam",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/114811136-cmd/dsh-plan-execute.git"
