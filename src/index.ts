@@ -86,6 +86,8 @@ export interface Config {
   executorTimeoutMs: number
   /** Max interactive fix rounds when subtasks fail or review rejects. */
   maxFixRounds: number
+  /** Hard timeout for the LLM-driven goal-clarification phase (ms). */
+  clarifyTimeoutMs: number
 }
 
 export const Config: z<Config> = z.object({
@@ -105,6 +107,7 @@ export const Config: z<Config> = z.object({
   maxDepth: z.number().step(1).min(0).max(8).default(3),
   executorTimeoutMs: z.number().step(1).min(10000).max(600000).default(120000),
   maxFixRounds: z.number().step(1).min(0).max(5).default(2),
+  clarifyTimeoutMs: z.number().step(1).min(60000).max(900000).default(300000),
 })
 
 /**
@@ -359,6 +362,14 @@ async function settle(run: SubagentRun, childEfforts: ChildEfforts): Promise<Sub
 // ── fixed instructions ─────────────────────────────────────────────────────
 // Each is mounted as the child's `persona` (system position, cache-stable).
 // Keep them static; dynamic data goes in the user `prompt`.
+
+const CLARIFY_INSTRUCTION = [
+  '你是需求澄清助手。用户给出了一个任务目标，你的唯一职责是把这个目标问清楚，而不是执行它。',
+  '关键点：目标路径、文件名、输入/输出格式、验收标准、技术栈、范围边界、优先级、交付物形态。',
+  '若任何关键点不明确，你必须使用 ask_user_question 工具向用户提问，一次最多 3 个问题（每个带稳定 id）；收到回答后若仍有不明确处，继续提问，可多轮，直到你确信已完全理解目标。',
+  '禁止猜测用户意图；信息不足时宁可多问一轮，不可臆测。',
+  '当目标已足够明确时，停止提问，只输出一段简洁的最终目标描述（要做什么、产出什么、验收标准），不要输出计划、不要输出 JSON、不要输出多余文字。',
+].join('\n')
 
 const PLANNER_INSTRUCTION = [
   '你是任务规划器。把下面的用户需求拆解为可独立执行的子任务，输出严格 JSON，禁止任何额外解释或 markdown 代码块。',
@@ -694,42 +705,38 @@ function collectFailed(results: TaskResult[], plan: Plan): FailedTaskInfo[] {
 }
 
 /**
- * 强制目标确认：在规划之前，先把对目标的理解摆给用户，必须得到
- * 明确确认（或补充说明）才继续。信息不足时绝不猜测。
+ * LLM 驱动的目标澄清：spawn 一个澄清者子代理，通过 ask_user_question 工具
+ * 与用户多轮对话，直到目标足够明确才输出最终目标描述。信息不足绝不猜测。
+ * 带硬超时（clarifyTimeoutMs），超时即中止，防止澄清阶段无限卡住。
  */
-async function clarifyGoal(
+async function clarifyPhase(
   ctx: Context,
+  config: Config,
   invocation: CommandInvocation,
   task: string,
+  childEfforts: ChildEfforts,
 ): Promise<string> {
-  // 复述理解，让用户确认或补充
-  const answer = await ctx.userQuestions.ask({
-    questions: [{
-      id: 'pe_goal',
-      question: '请确认我对你目标的理解，确认后才开始规划执行：',
-      detail: `你输入的原始需求：\n> ${task}\n\n若理解有偏差或需要补充细节（目标路径、输出格式、验收标准、技术栈、优先级等），请直接补充说明；确认无误则选「目标已明确，继续」。`,
-      options: [
-        { label: '目标已明确，继续', description: '按上述理解开始规划' },
-        { label: '目标理解有误', description: '不继续；请补充说明或取消后重新发送 /pe' },
-      ],
-    }],
-    agent: invocation.agent,
-    signal: invocation.signal,
-  })
-  const item = answer.answers.find(entry => entry.id === 'pe_goal')
-  const selected = item?.selected ?? []
-  const custom = item?.custom?.trim() ?? ''
-
-  // 用户明确确认理解无误 → 用原始需求继续
-  if (selected.includes('目标已明确，继续')) {
-    return task
+  const run = await spawn(
+    ctx, config, invocation,
+    config.plannerModel, config.plannerEffort, childEfforts,
+    plannerPrompt(task), CLARIFY_INSTRUCTION,
+    undefined, 'clarify',
+  )
+  const result = await settleWithTimeout(run, childEfforts, config.clarifyTimeoutMs)
+  if (invocation.signal.aborted) {
+    throw new Error('已停止')
   }
-  // 用户填了补充说明 → 把补充内容并入需求（无论选了哪个选项都尊重补充）
-  if (custom.length > 0) {
-    return `${task}\n\n【用户补充】${custom}`
+  if (result.stopReason !== 'completed' || result.timedOut) {
+    const why = result.timedOut
+      ? `目标澄清超时（${Math.round(config.clarifyTimeoutMs / 1000)}s）`
+      : `stopReason=${result.stopReason}`
+    throw new Error(`目标澄清失败：${why}。请重新发送 /pe 并给出更清晰的目标。`)
   }
-  // 没有确认也没有补充 → 信息不足，禁止猜测继续
-  throw new Error('目标未确认：请重新发送 /pe 并给出更清晰的目标。')
+  const clarified = extractText(result.output).trim()
+  if (clarified.length === 0) {
+    throw new Error('目标澄清无结果：请重新发送 /pe。')
+  }
+  return clarified
 }
 
 async function run(
@@ -744,8 +751,8 @@ async function run(
   }
   const signal = invocation.signal
   try {
-    // 强制目标确认：必须先明确理解目标，才允许进入规划
-    const clarified = await clarifyGoal(ctx, invocation, task)
+    // 对话式目标澄清：LLM 追问关键点直到目标明确，信息不足绝不猜测
+    const clarified = await clarifyPhase(ctx, config, invocation, task, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     const plan = await planPhase(ctx, config, invocation, clarified, childEfforts)
