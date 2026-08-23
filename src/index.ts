@@ -655,64 +655,53 @@ async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Pl
   return selected.includes('执行')
 }
 
-/** One failed subtask, rendered for the fix prompt. */
-interface FailedTaskInfo {
-  task_id: string
-  description: string
-  reason: string
-}
-
 /**
- * 失败交互：子任务失败或复核不通过时，停下来让用户决定怎么处理。
- * @returns the user's decision; `modifyText` carries the user's written fix
- *   requirement when the action is `modify`.
+ * 完工验收：展示所有子任务结果，让用户勾选需要修改的子任务。
+ * 勾选后只重跑选中的任务，其余结果保留——绝不重跑全部。
+ * 不勾选任何任务（或选「结束」）则视为满意，结束本次 /pe。
  */
-async function askFixStrategy(
+async function askWorkshop(
   ctx: Context,
   invocation: CommandInvocation,
-  failed: FailedTaskInfo[],
-  problems: string[],
-): Promise<{ action: 'modify' | 'retry' | 'accept' | 'abort'; modifyText: string }> {
-  const detailLines = failed.map(f => `- ${f.task_id} ${f.description}\n  （${f.reason}）`)
-  const problemLine = problems.length > 0 ? `\n复核问题：${problems.join('；')}` : ''
+  plan: Plan,
+  results: TaskResult[],
+): Promise<{ action: 'done' | 'modify'; modifyTaskIds: string[]; modifyText: string }> {
+  const byId = new Map(plan.tasks.map(task => [task.task_id, task]))
+  const resultLines = results
+    .filter(result => result !== undefined)
+    .map(result => {
+      const desc = byId.get(result.task_id)?.description ?? ''
+      return `- ${result.task_id} ${result.ok ? '✓' : '✗'}：${desc}`
+    })
+  const taskOptions = results
+    .filter(result => result !== undefined)
+    .map(result => ({
+      label: result.task_id,
+      description: byId.get(result.task_id)?.description ?? '重跑该任务',
+    }))
   const answer = await ctx.userQuestions.ask({
     questions: [{
-      id: 'pe_fix',
-      question: '部分子任务未通过，如何处理？',
-      detail: `失败任务：\n${detailLines.join('\n')}${problemLine}\n\n若选「修改后重跑」，请在下方填写修改要求（如改哪里、怎么改）。`,
+      id: 'pe_workshop',
+      question: '全部完成。有需要修改的子任务吗？（勾选可只重跑选中项，不清空其他结果）',
+      detail: `结果：\n${resultLines.join('\n')}\n\n满意就选「结束」；要改就勾选对应子任务，并在下方填写修改要求。`,
       options: [
-        { label: '修改后重跑', description: '按你的修改要求重新执行失败任务' },
-        { label: '直接重跑', description: '不改动，重新执行失败任务' },
-        { label: '接受结果', description: '保留当前结果（含失败），结束本次 /pe' },
-        { label: '终止', description: '停止本次 /pe，不重跑' },
+        { label: '结束（满意）', description: '保留当前结果，结束' },
+        ...taskOptions,
       ],
+      multiSelect: true,
     }],
     agent: invocation.agent,
     signal: invocation.signal,
   })
-  const item = answer.answers.find(entry => entry.id === 'pe_fix')
+  const item = answer.answers.find(entry => entry.id === 'pe_workshop')
   const selected = item?.selected ?? []
   const custom = item?.custom?.trim() ?? ''
-  if (selected.includes('修改后重跑')) {
-    return { action: 'modify', modifyText: custom.length > 0 ? custom : '请按上述失败原因修正后重跑。' }
+  const taskIds = new Set(plan.tasks.map(task => task.task_id))
+  const modifyTaskIds = selected.filter(id => taskIds.has(id))
+  if (modifyTaskIds.length === 0) {
+    return { action: 'done', modifyTaskIds: [], modifyText: '' }
   }
-  if (selected.includes('直接重跑')) return { action: 'retry', modifyText: '' }
-  if (selected.includes('接受结果')) return { action: 'accept', modifyText: '' }
-  // 未选任何已知项 → 视为终止，绝不擅自重跑。
-  return { action: 'abort', modifyText: '' }
-}
-
-/** Collect the failed subtasks with their plan description and failure reason. */
-function collectFailed(results: TaskResult[], plan: Plan): FailedTaskInfo[] {
-  const byId = new Map(plan.tasks.map(task => [task.task_id, task]))
-  const failed: FailedTaskInfo[] = []
-  for (const result of results) {
-    if (result === undefined || result.ok) continue
-    const description = byId.get(result.task_id)?.description ?? ''
-    const reason = result.text.length > 120 ? `${result.text.slice(0, 120)}…` : result.text
-    failed.push({ task_id: result.task_id, description, reason })
-  }
-  return failed
+  return { action: 'modify', modifyTaskIds, modifyText: custom.length > 0 ? custom : '请按上述要求修正该子任务。' }
 }
 
 /**
@@ -791,30 +780,20 @@ async function run(
       if (signal.aborted) return { kind: 'error', text: '已停止' }
     }
 
-    // 失败交互：子任务失败或复核不通过时，停下来问用户怎么处理，
-    // 而不是自动重跑一次就结束。最多 maxFixRounds 轮，且必须用户确认。
+    // 完工验收：无论成败，都让用户确认是否满意；不满意可只勾选子任务重跑，绝不重跑全部。
     for (let round = 0; round < config.maxFixRounds; round += 1) {
-      const failed = collectFailed(results, plan)
-      const needsFix = failed.length > 0 || (verdict !== undefined && !verdict.pass)
-      if (!needsFix) break
       if (signal.aborted) return { kind: 'error', text: '已停止' }
 
-      const decision = await askFixStrategy(ctx, invocation, failed, verdict?.problems ?? [])
+      const decision = await askWorkshop(ctx, invocation, plan, results)
       if (signal.aborted) return { kind: 'error', text: '已停止' }
-      if (decision.action === 'abort') {
-        return { kind: 'success', text: '已终止，未继续重跑。' }
-      }
-      if (decision.action === 'accept') break
+      if (decision.action === 'done') break
 
-      // retry 或 modify：重跑全部失败/复核标记的任务。
-      const retryIds = new Set(failed.map(f => f.task_id))
-      for (const id of verdict?.retryTaskIds ?? []) retryIds.add(id)
-      const modifyText = decision.action === 'modify' ? decision.modifyText : ''
       const retryTasks = plan.tasks
-        .filter(task => retryIds.has(task.task_id))
-        .map(task => modifyText.length > 0
-          ? { ...task, description: `${task.description}\n【用户修改要求】${modifyText}` }
-          : task)
+        .filter(task => decision.modifyTaskIds.includes(task.task_id))
+        .map(task => ({
+          ...task,
+          description: `${task.description}\n【用户修改要求】${decision.modifyText}`,
+        }))
       if (retryTasks.length === 0) break
 
       const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks }, childEfforts)
