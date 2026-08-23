@@ -951,6 +951,7 @@ async function clarifyPhase(
   const history: string[] = [`用户初始需求：${task}`]
   const maxRounds = 5
   let summary = task
+  let clarified = false
 
   for (let round = 0; round < maxRounds; round += 1) {
     if (invocation.signal.aborted) throw new Error('已停止')
@@ -979,6 +980,7 @@ async function clarifyPhase(
     // 子代理认为已明确 → 返回摘要。
     if (judge?.done === true && typeof judge.summary === 'string' && judge.summary.trim().length > 0) {
       summary = judge.summary.trim()
+      clarified = true
       break
     }
     const question = typeof judge?.question === 'string' ? judge.question.trim() : ''
@@ -1008,7 +1010,9 @@ async function clarifyPhase(
     history.push(`问：${question}`, `答：${reply}`)
   }
 
-  if (summary.length === 0) summary = history.join('\n')
+  // 循环结束：若始终没拿到明确摘要（5 轮问完仍不明确），
+  // 用完整问答历史作为规划输入，保证收集到的信息不丢失。
+  if (!clarified) summary = history.join('\n')
   return { summary, fullAnswer: summary }
 }
 
