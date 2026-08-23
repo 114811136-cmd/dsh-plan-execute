@@ -655,17 +655,57 @@ async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Pl
   return selected.includes('执行')
 }
 
+/** One diagnosis item: which subtask to fix, why, and its revised description. */
+interface FixItem {
+  task_id: string
+  reason: string
+  revised_description: string
+}
+
+/** The LLM's diagnosis: which subtasks to re-run and how. */
+interface FixPlan {
+  tasks: FixItem[]
+}
+
+/** Object-rooted JSON schema for the fix-diagnosis structured output. */
+const FIX_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['tasks'],
+  properties: {
+    tasks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['task_id', 'reason', 'revised_description'],
+        properties: {
+          task_id: { type: 'string' },
+          reason: { type: 'string' },
+          revised_description: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+const FIX_INSTRUCTION = [
+  '你是任务诊断专家。用户对已完成的结果提出不满或改进要求，你只负责判断：哪个子任务需要重新执行、应该改造成什么样。不要真的执行，只输出诊断方案。',
+  '用户会给出：原始目标、各子任务的产出、以及他的问题/要求。',
+  '规则：只改动真正受用户问题影响的子任务，未被影响的子任务不要列入；rest_reason 用一句话说明为什么改它；revised_description 写清楚修改后该子任务要重新做什么（足够明确，供执行者照做）。',
+  '若用户的问题不针对任何现有子任务，或信息不足无法定位，输出空数组 tasks。',
+].join('\n')
+
 /**
- * 完工验收：展示所有子任务结果，让用户勾选需要修改的子任务。
- * 勾选后只重跑选中的任务，其余结果保留——绝不重跑全部。
- * 不勾选任何任务（或选「结束」）则视为满意，结束本次 /pe。
+ * 完工询问：展示结果，让用户描述不满/要求（而不是勾选）。
+ * 返回用户是否满意、以及描述的问题文本。
  */
-async function askWorkshop(
+async function askSatisfaction(
   ctx: Context,
   invocation: CommandInvocation,
   plan: Plan,
   results: TaskResult[],
-): Promise<{ action: 'done' | 'modify'; modifyTaskIds: string[]; modifyText: string }> {
+): Promise<{ satisfied: boolean; problem: string }> {
   const byId = new Map(plan.tasks.map(task => [task.task_id, task]))
   const resultLines = results
     .filter(result => result !== undefined)
@@ -673,35 +713,113 @@ async function askWorkshop(
       const desc = byId.get(result.task_id)?.description ?? ''
       return `- ${result.task_id} ${result.ok ? '✓' : '✗'}：${desc}`
     })
-  const taskOptions = results
-    .filter(result => result !== undefined)
-    .map(result => ({
-      label: result.task_id,
-      description: byId.get(result.task_id)?.description ?? '重跑该任务',
-    }))
   const answer = await ctx.userQuestions.ask({
     questions: [{
-      id: 'pe_workshop',
-      question: '全部完成。有需要修改的子任务吗？（勾选可只重跑选中项，不清空其他结果）',
-      detail: `结果：\n${resultLines.join('\n')}\n\n满意就选「结束」；要改就勾选对应子任务，并在下方填写修改要求。`,
+      id: 'pe_satis',
+      question: '全部完成。满意吗？如有要调整的地方，请直接在下框描述你的问题/要求。',
+      detail: `结果：\n${resultLines.join('\n')}\n\n满意请选「结束」；要改就直接描述问题（例如：报表格式不对，我需要柱状图；T003 的数据有误）。`,
       options: [
         { label: '结束（满意）', description: '保留当前结果，结束' },
-        ...taskOptions,
       ],
-      multiSelect: true,
     }],
     agent: invocation.agent,
     signal: invocation.signal,
   })
-  const item = answer.answers.find(entry => entry.id === 'pe_workshop')
+  const item = answer.answers.find(entry => entry.id === 'pe_satis')
   const selected = item?.selected ?? []
   const custom = item?.custom?.trim() ?? ''
-  const taskIds = new Set(plan.tasks.map(task => task.task_id))
-  const modifyTaskIds = selected.filter(id => taskIds.has(id))
-  if (modifyTaskIds.length === 0) {
-    return { action: 'done', modifyTaskIds: [], modifyText: '' }
+  if (selected.includes('结束（满意）')) {
+    return { satisfied: true, problem: '' }
   }
-  return { action: 'modify', modifyTaskIds, modifyText: custom.length > 0 ? custom : '请按上述要求修正该子任务。' }
+  // 未选结束但有补充说明 → 视为用户提出了问题。
+  if (custom.length > 0) {
+    return { satisfied: false, problem: custom }
+  }
+  // 未选结束也没填什么 → 视为满意结束。
+  return { satisfied: true, problem: '' }
+}
+
+/**
+ * LLM 诊断：根据用户描述的问题，判断哪个子任务要改、怎么改（只给方案，不执行）。
+ */
+async function diagnoseFix(
+  ctx: Context,
+  config: Config,
+  invocation: CommandInvocation,
+  plan: Plan,
+  results: TaskResult[],
+  problem: string,
+  childEfforts: ChildEfforts,
+): Promise<FixPlan> {
+  const byId = new Map(plan.tasks.map(task => [task.task_id, task]))
+  const resultLines = results
+    .filter(result => result !== undefined)
+    .map(result => {
+      const desc = byId.get(result.task_id)?.description ?? ''
+      const outcome = result.ok ? '成功' : '失败'
+      const snippet = result.text.length > 160 ? `${result.text.slice(0, 160)}…` : result.text
+      return `【${result.task_id}】${desc}\n状态：${outcome}\n产出：${snippet}`
+    })
+  const prompt = [
+    `原始目标：${plan.goal}`,
+    `用户问题/要求：${problem}`,
+    '',
+    '各子任务产出：',
+    resultLines.join('\n'),
+  ].join('\n')
+  const run = await spawn(
+    ctx, config, invocation,
+    config.plannerModel, config.clarifyEffort, childEfforts,
+    prompt, FIX_INSTRUCTION, FIX_SCHEMA, 'fix-diagnose',
+  )
+  const result = await settle(run, childEfforts)
+  if (result.stopReason !== 'completed') {
+    return { tasks: [] }
+  }
+  const raw = (result.structured ?? parseJson(extractText(result.output))) as FixPlan | undefined
+  if (raw === undefined || !Array.isArray(raw.tasks)) {
+    return { tasks: [] }
+  }
+  const knownIds = new Set(plan.tasks.map(task => task.task_id))
+  const tasks = raw.tasks
+    .filter(item => item !== undefined && knownIds.has(item.task_id)
+      && typeof item.revised_description === 'string' && item.revised_description.length > 0)
+    .map(item => ({
+      task_id: item.task_id,
+      reason: typeof item.reason === 'string' ? item.reason : '',
+      revised_description: item.revised_description,
+    }))
+  return { tasks }
+}
+
+/**
+ * 方案确认：展示诊断出的修改方案，请用户确认是否执行。
+ */
+async function confirmFix(
+  ctx: Context,
+  invocation: CommandInvocation,
+  fix: FixPlan,
+): Promise<boolean> {
+  const lines = fix.tasks.map(item => {
+    const reason = item.reason.length > 0 ? `\n  原因：${item.reason}` : ''
+    return `- ${item.task_id}${reason}\n  修改后：${item.revised_description}`
+  })
+  const answer = await ctx.userQuestions.ask({
+    questions: [{
+      id: 'pe_fixconfirm',
+      question: '诊断到以下修改方案，是否执行？',
+      detail: `建议修改 ${fix.tasks.length} 个子任务（其余保留）：\n${lines.join('\n')}`,
+      options: [
+        { label: '确认执行', description: '只重跑上述子任务，其他结果保留' },
+        { label: '放弃修改', description: '不重跑，保留当前结果结束' },
+      ],
+    }],
+    agent: invocation.agent,
+    signal: invocation.signal,
+  })
+  const item = answer.answers.find(entry => entry.id === 'pe_fixconfirm')
+  const selected = item?.selected ?? []
+  return selected.includes('确认执行')
 }
 
 /**
@@ -780,19 +898,32 @@ async function run(
       if (signal.aborted) return { kind: 'error', text: '已停止' }
     }
 
-    // 完工验收：无论成败，都让用户确认是否满意；不满意可只勾选子任务重跑，绝不重跑全部。
+    // 完工验收：问用户是否满意；不满意则描述问题 → LLM 诊断改哪个子任务 → 出方案确认 → 只重跑选中项。
     for (let round = 0; round < config.maxFixRounds; round += 1) {
       if (signal.aborted) return { kind: 'error', text: '已停止' }
 
-      const decision = await askWorkshop(ctx, invocation, plan, results)
+      const satis = await askSatisfaction(ctx, invocation, plan, results)
       if (signal.aborted) return { kind: 'error', text: '已停止' }
-      if (decision.action === 'done') break
+      if (satis.satisfied) break
 
+      // 用户描述了问题 → LLM 诊断哪个子任务要改、怎么改（只给方案）。
+      const fix = await diagnoseFix(ctx, config, invocation, plan, results, satis.problem, childEfforts)
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
+      if (fix.tasks.length === 0) {
+        return { kind: 'success', text: `未定位到需修改的子任务：${satis.problem}\n\n${renderSummary(plan, results, verdict)}` }
+      }
+
+      // 先出方案，确认后才执行。
+      const confirmed = await confirmFix(ctx, invocation, fix)
+      if (signal.aborted) return { kind: 'error', text: '已停止' }
+      if (!confirmed) break
+
+      const fixById = new Map(fix.tasks.map(item => [item.task_id, item]))
       const retryTasks = plan.tasks
-        .filter(task => decision.modifyTaskIds.includes(task.task_id))
+        .filter(task => fixById.has(task.task_id))
         .map(task => ({
           ...task,
-          description: `${task.description}\n【用户修改要求】${decision.modifyText}`,
+          description: fixById.get(task.task_id)?.revised_description ?? task.description,
         }))
       if (retryTasks.length === 0) break
 
