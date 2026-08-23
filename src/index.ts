@@ -738,12 +738,11 @@ async function confirmPlan(
     questions: [{
       id: 'pe_confirm',
       question: '计划已生成，确认执行、取消，或填写修改要求：',
-      detail: `需求：${fullAnswer}\n\n${renderPlanDetail(plan)}\n\n若需修改，请直接在下方输入（例如：T003 改成柱状图）。`,
+      detail: `需求：${fullAnswer}\n\n${renderPlanDetail(plan)}\n\n若需修改，请在下方输入框填写（例如：T003 改成柱状图），然后提交。`,
       options: [
         { label: '执行', description: '按计划并行执行子任务' },
         { label: '取消', description: '不执行任何子任务，结束本次 /pe' },
       ],
-      intent: { kind: 'plan-review', approve: '执行' },
     }],
     agent: invocation.agent,
     signal: invocation.signal,
