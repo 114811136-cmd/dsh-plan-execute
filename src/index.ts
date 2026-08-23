@@ -193,6 +193,14 @@ function statePath(cwd: string): string {
   return join(cwd, STATE_FILENAME)
 }
 
+/** Normalize a file path for reliable archive matching (no `./` prefix, forward slashes). */
+function normalizeFile(file: string): string {
+  let f = file.trim().replace(/\\/g, '/')
+  while (f.startsWith('./')) f = f.slice(2)
+  while (f.startsWith('/')) f = f.slice(1)
+  return f
+}
+
 /** Read the persisted project state; undefined when absent or unreadable. */
 async function readState(cwd: string): Promise<ProjectState | undefined> {
   try {
@@ -216,32 +224,47 @@ async function writeState(cwd: string, state: ProjectState): Promise<void> {
   }
 }
 
+/** Keywords that mark a "delete this module" task. */
+const DELETE_HINTS = ['删除', '移除', '删掉', '去掉', '弃用']
+
 /**
- * Merge the just-planned tasks into the previous state. A new task whose
- * `files` intersect an existing module's files is treated as a revision of
- * that module (overwrite); otherwise it is appended as a new module.
+ * Merge the just-planned tasks into the previous state.
+ * - A task whose files intersect an existing module's files is a revision
+ *   (overwrite description, UNION the file lists).
+ * - A task marked as a deletion removes the matching module.
+ * - Otherwise the task is appended as a new module.
+ * - The overall goal is preserved from the prior state (a later /pe's plan
+ *   goal is the SUB-goal, not the project's root goal).
  */
 function mergeState(old: ProjectState | undefined, plan: Plan): ProjectState {
-  const modules = (old?.modules ?? []).map(module => ({ ...module }))
+  const modules = (old?.modules ?? []).map(module => ({ ...module, files: [...module.files] }))
   for (const task of plan.tasks) {
-    const files = task.files ?? []
+    const files = (task.files ?? []).map(normalizeFile).filter(file => file.length > 0)
     const idx = modules.findIndex(module => module.files.some(file => files.includes(file)))
-    if (idx >= 0) {
-      modules[idx] = { task_id: task.task_id, description: task.description, files }
-    } else {
+    const isDelete = DELETE_HINTS.some(hint => task.description.includes(hint))
+    if (idx >= 0 && isDelete) {
+      modules.splice(idx, 1)
+    } else if (idx >= 0) {
+      modules[idx] = {
+        task_id: task.task_id,
+        description: task.description,
+        files: [...new Set([...modules[idx].files, ...files])],
+      }
+    } else if (files.length > 0) {
       modules.push({ task_id: task.task_id, description: task.description, files })
     }
+    // files empty with no match → cannot locate, skip (do not append junk).
   }
-  return { goal: plan.goal, modules }
+  return { goal: old?.goal ?? plan.goal, modules }
 }
 
-/** Render the persisted state as planner prompt context. */
+/** Render the persisted state as planner prompt context (ordinal index, not task_id, to avoid cross-run id collisions). */
 function renderStatePrompt(state: ProjectState): string {
   const lines: string[] = [`现有项目：${state.goal}`, '已完成模块：']
-  for (const module of state.modules) {
+  state.modules.forEach((module, index) => {
     const files = module.files.length > 0 ? ` → ${module.files.join(', ')}` : ''
-    lines.push(`- ${module.task_id} ${module.description}${files}`)
-  }
+    lines.push(`${index + 1}. ${module.description}${files}`)
+  })
   return lines.join('\n')
 }
 
@@ -460,7 +483,7 @@ const PLANNER_INSTRUCTION = [
   '你是任务规划器。把下面的用户需求拆解为可独立执行的子任务，输出严格 JSON，禁止任何额外解释或 markdown 代码块。',
   '结构：{"goal":"整体目标","constraints":["约束"],"tasks":[{"task_id":"T001","description":"足够明确的单步指令","output_format":"text|json|markdown","depend_on":[],"files":["涉及的文件路径"]}]}',
   '规则：一个子任务只做一件事；depend_on 填依赖的 task_id；不要生成模糊指令。',
-  '每个子任务必须用 files 字段声明它将要创建或修改的文件路径（相对工作区），这是后续增量迭代的关键依据，不能省略。',
+  '每个子任务必须用 files 字段声明它将要创建或修改的文件路径（相对工作区），这是后续增量迭代的关键依据，不能省略。文件路径用相对路径，不要带 ./ 前缀，统一用正斜杠 /。',
   '若需求里给出了「现有项目现状」（已有模块及文件清单），你必须只拆本次需求相关的新任务或修改任务；已完成的模块不要重复拆解，只在其需要被修改时才列入，并在 files 里指向对应文件。',
   '注意：用户需求已经过澄清确认，直接拆解即可，不要向用户提问；若仍有无法确定的关键点，把它写进 constraints 作为假设条件，并在任务中做出合理默认。',
 ].join('\n')
@@ -1010,6 +1033,12 @@ async function run(
           description: fixById.get(task.task_id)?.revised_description ?? task.description,
         }))
       if (retryTasks.length === 0) break
+
+      // 把诊断后的新描述同步回 plan，确保档案记录的是最终版任务。
+      for (const item of fix.tasks) {
+        const target = plan.tasks.find(task => task.task_id === item.task_id)
+        if (target !== undefined) target.description = item.revised_description
+      }
 
       const retried = await executePhase(ctx, config, invocation, { ...plan, tasks: retryTasks }, childEfforts)
       if (signal.aborted) return { kind: 'error', text: '已停止' }
