@@ -1016,6 +1016,41 @@ async function clarifyPhase(
   return { summary, fullAnswer: summary }
 }
 
+/**
+ * 目标确认：把澄清后总结出的真实目标摆给用户，确认理解后才继续规划。
+ * 用户可确认，或补充更多信息（补充内容并入目标后返回）。
+ */
+async function confirmGoal(
+  ctx: Context,
+  invocation: CommandInvocation,
+  summary: string,
+): Promise<string> {
+  const answer = await ctx.userQuestions.ask({
+    questions: [{
+      id: 'pe_goal_confirm',
+      question: '我理解你的目标是（请确认）：',
+      detail: summary,
+      options: [
+        { label: '理解正确，开始规划', description: '进入规划阶段' },
+        { label: '还要补充', description: '补充更多信息后再规划' },
+      ],
+    }],
+    agent: invocation.agent,
+    signal: invocation.signal,
+  })
+  const item = answer.answers.find(entry => entry.id === 'pe_goal_confirm')
+  const selected = item?.selected ?? []
+  const custom = item?.custom?.trim() ?? ''
+  if (selected.includes('理解正确，开始规划')) {
+    return summary
+  }
+  if (custom.length > 0) {
+    return `${summary}\n\n【用户补充】${custom}`
+  }
+  // 没确认也没补充 → 视为确认，避免卡住。
+  return summary
+}
+
 async function run(
   ctx: Context,
   config: Config,
@@ -1032,19 +1067,23 @@ async function run(
     const clarification = await clarifyPhase(ctx, config, invocation, task, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
+    // 目标确认：总结真实目标，用户确认理解后才继续规划。
+    const confirmedGoal = await confirmGoal(ctx, invocation, clarification.summary)
+    if (signal.aborted) return { kind: 'error', text: '已停止' }
+
     // 增量迭代：读取工作区已有的项目档案，注入规划器作为"现状"，
     // 让规划器只拆本次需求相关的新/改任务，不重做已完成模块。
     const cwd = invocation.agent.session.header.cwd
     const priorState = cwd === undefined ? undefined : await readState(cwd)
     const planInput = priorState === undefined
-      ? clarification.summary
-      : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${clarification.summary}`
+      ? confirmedGoal
+      : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${confirmedGoal}`
 
     const plan = await planPhase(ctx, config, invocation, planInput, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
-      const approved = await confirmPlan(ctx, invocation, plan, clarification.fullAnswer)
+      const approved = await confirmPlan(ctx, invocation, plan, confirmedGoal)
       if (!approved) {
         return { kind: 'success', text: '已取消，未执行任何子任务。' }
       }
