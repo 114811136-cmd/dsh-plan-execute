@@ -472,25 +472,29 @@ const CLARIFY_JUDGE_SCHEMA: ObjectJsonSchema = {
     done: { type: 'boolean' },
     question: { type: 'string' },
     summary: { type: 'string' },
+    giveup: { type: 'boolean' },
   },
 }
 
 /**
  * The clarify judge only THINKS about the next question (or decides the goal
- * is clear); it never asks the user itself — the MAIN task owns the question
- * channel (only a runtime-root agent may call userQuestions.ask).
+ * is clear / unfixable); it never asks the user itself — the MAIN task owns the
+ * question channel (only a runtime-root agent may call userQuestions.ask).
  */
 const CLARIFY_INSTRUCTION = [
   '你是需求澄清的提问大脑。你会看到用户的初始需求，以及已经问过的问题和用户的回答。',
   '你的任务是判断需求是否已足够明确，并输出严格 JSON（禁止任何额外解释或 markdown 代码块）。',
-  '输出格式二选一：{"done":false,"question":"你下一个要问的最关键问题"} 或 {"done":true,"summary":"明确后的需求摘要"}',
+  '输出格式三选一：',
+  '1. {"done":true,"summary":"明确后的需求摘要"} —— 需求已足够明确，可以开始规划',
+  '2. {"done":false,"question":"你下一个要问的最关键问题"} —— 还需要继续追问',
+  '3. {"giveup":true} —— 需求已无法通过追问明确（见下方放弃规则）',
   '追问规则（done=false 时）：',
   '1. 一次只问 1 个最关键的问题，尖锐、具体、必要，不泛泛而问、不重复已问过的问题。',
   '2. 紧接用户上一轮的回答深入追问，形成追问链。',
   '3. 要问清楚的维度：真实需求、使用场景、目标结果、限制条件、判断标准、隐藏偏好。',
   '4. 禁止猜测用户意图；信息不足就问，但不要为问而问。',
-  '停止规则（done=true 时）：当你已基本理解真实需求并能据此给出可执行方案时，输出 summary。',
-  'summary 必须用精简文字写明：真实需求、约束条件、验收标准、关键提醒（各一句）。',
+  '明确规则（done=true 时）：当你已基本理解真实需求并能据此给出可执行方案时，输出 summary。summary 用精简文字写明：真实需求、约束条件、验收标准、关键提醒（各一句）。',
+  '放弃规则（giveup=true 时）：当用户连续几轮回答"不知道/不清楚/随便"、或信息缺失到无法继续追问时，输出 {"giveup":true}，不要无限追问、不要重复问。',
 ].join('\n')
 
 const PLANNER_INSTRUCTION = [
@@ -949,14 +953,13 @@ async function clarifyPhase(
   childEfforts: ChildEfforts,
 ): Promise<{ summary: string; fullAnswer: string }> {
   const history: string[] = [`用户初始需求：${task}`]
-  const maxRounds = 5
-  let summary = task
-  let clarified = false
+  // 纯保险上限（防 LLM 死循环），正常由子代理判断何时"明确"或"放弃"。
+  const maxRounds = 20
 
   for (let round = 0; round < maxRounds; round += 1) {
     if (invocation.signal.aborted) throw new Error('已停止')
 
-    // 1. 子代理判断：还需要问什么？或者需求已明确？
+    // 1. 子代理判断：明确 / 继续问 / 放弃。
     const prompt = [
       ...history,
       '',
@@ -970,23 +973,23 @@ async function clarifyPhase(
     const result = await settleWithTimeout(run, childEfforts, config.clarifyTimeoutMs)
     if (invocation.signal.aborted) throw new Error('已停止')
     if (result.stopReason !== 'completed' || result.timedOut) {
-      // 判断失败不阻塞整个 /pe：用已有信息继续。
-      summary = history.join('\n')
-      break
+      throw new Error('需求澄清未完成（判断失败），请重新发送 /pe 并给出更清晰的目标。')
     }
     const judge = (result.structured ?? parseJson(extractText(result.output))) as
-      | { done?: boolean; question?: string; summary?: string } | undefined
+      | { done?: boolean; question?: string; summary?: string; giveup?: boolean } | undefined
 
-    // 子代理认为已明确 → 返回摘要。
+    // 子代理判断：无法通过追问明确 → 放弃，不硬做。
+    if (judge?.giveup === true) {
+      throw new Error('需求无法通过追问明确，请重新发送 /pe 并给出更清晰的目标。')
+    }
+    // 子代理判断：已明确 → 返回摘要。
     if (judge?.done === true && typeof judge.summary === 'string' && judge.summary.trim().length > 0) {
-      summary = judge.summary.trim()
-      clarified = true
-      break
+      const summary = judge.summary.trim()
+      return { summary, fullAnswer: summary }
     }
     const question = typeof judge?.question === 'string' ? judge.question.trim() : ''
     if (question.length === 0) {
-      summary = (judge?.summary ?? '').trim() || history.join('\n')
-      break
+      throw new Error('需求澄清未完成，请重新发送 /pe 并给出更清晰的目标。')
     }
 
     // 2. 主任务提问（runtime root 才有资格问用户）。
@@ -1002,18 +1005,15 @@ async function clarifyPhase(
     if (invocation.signal.aborted) throw new Error('已停止')
     const item = answer.answers.find(entry => entry.id === `pe_clarify_${round}`)
     const reply = (item?.custom ?? '').trim() || (item?.selected ?? []).join('、')
-    if (reply.length === 0) {
-      // 用户没回答 → 结束，用已有信息。
-      summary = (judge.summary ?? '').trim() || history.join('\n')
-      break
+    // 用户放弃或答不上来 → 明确停止，不硬做。
+    if (reply.length === 0 || /不知道|不清楚|随便|放弃|跳过|无所谓|没想法|没要求|再说/i.test(reply)) {
+      throw new Error('需求无法明确：已停止追问。请重新发送 /pe 并给出更清晰的目标。')
     }
     history.push(`问：${question}`, `答：${reply}`)
   }
 
-  // 循环结束：若始终没拿到明确摘要（5 轮问完仍不明确），
-  // 用完整问答历史作为规划输入，保证收集到的信息不丢失。
-  if (!clarified) summary = history.join('\n')
-  return { summary, fullAnswer: summary }
+  // 保险上限用完仍未明确 → 放弃。
+  throw new Error('需求澄清轮数过多仍未明确，请重新描述更清晰的目标。')
 }
 
 /**
