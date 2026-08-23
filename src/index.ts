@@ -75,9 +75,11 @@ export interface Config {
   confirm: boolean
   /** Thinking effort for the planner child. */
   plannerEffort: Effort
+  /** Thinking effort for the clarify child (`low` is enough for asking questions). */
+  clarifyEffort: Effort
   /** Thinking effort for executor children (`off` saves the most tokens). */
   executorEffort: Effort
-  /** Thinking effort for the reviewer child. */
+  /** Thinking effort for the reviewer child (`low` is enough for pass/fail). */
   reviewerEffort: Effort
   /** Delegation-depth cap passed to every child. */
   maxDepth: number
@@ -102,8 +104,9 @@ export const Config: z<Config> = z.object({
   review: z.boolean().default(true),
   confirm: z.boolean().default(true),
   plannerEffort: z.union(['off', 'low', 'high', 'max'] as const).default('high'),
+  clarifyEffort: z.union(['off', 'low', 'high', 'max'] as const).default('low'),
   executorEffort: z.union(['off', 'low', 'high', 'max'] as const).default('off'),
-  reviewerEffort: z.union(['off', 'low', 'high', 'max'] as const).default('high'),
+  reviewerEffort: z.union(['off', 'low', 'high', 'max'] as const).default('low'),
   maxDepth: z.number().step(1).min(0).max(8).default(3),
   executorTimeoutMs: z.number().step(1).min(10000).max(600000).default(120000),
   maxFixRounds: z.number().step(1).min(0).max(5).default(2),
@@ -373,12 +376,9 @@ const CLARIFY_INSTRUCTION = [
   '4. 要问清楚的全部维度：真实需求（到底要解决什么问题、核心痛点是什么）、使用场景（在什么情况下用、谁在用）、目标结果（做到什么程度算成功）、限制条件（时间/预算/技术/环境/合规约束）、判断标准（怎么验收才算通过）、隐藏偏好（用户没明说但影响选择的倾向）。',
   '5. 克制提问：每轮只问当前最影响方案的那一个问题，不要为问而问。',
   '停止条件：当你认为已经基本理解用户的真实需求，并能据此给出可执行方案时，立即停止追问，不要再问。',
-  '停止追问后，输出最终答案，必须严格包含以下五部分（用清晰的小标题分隔）：',
-  '- 【真实需求】你理解到的用户真实需求（复述确认）',
-  '- 【方案】最适合用户的方案',
-  '- 【理由】为什么这样做（简洁说明取舍）',
-  '- 【执行步骤】具体可执行的步骤',
-  '- 【关键提醒】用户最容易忽略的提醒',
+  '停止追问后，输出两段内容，用标题严格隔开：',
+  '第一段标题为「【需求摘要】」：只写内部规划所需的精简信息——真实需求、约束条件、验收标准、关键提醒各一句话。不要写方案、理由或执行步骤（这些由后续规划阶段生成）。',
+  '第二段标题为「【完整答案】」：给用户看的完整答案，必须包含五部分——真实需求、最适合的方案、为什么这样做、具体执行步骤、最容易忽略的关键提醒。',
   '输出为纯文本，不要输出 JSON，不要输出多余格式。',
 ].join('\n')
 
@@ -636,12 +636,12 @@ function renderPlanDetail(plan: Plan): string {
 }
 
 /** Ask the user to approve the plan before any executor runs. */
-async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Plan): Promise<boolean> {
+async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Plan, fullAnswer: string): Promise<boolean> {
   const answer = await ctx.userQuestions.ask({
     questions: [{
       id: 'pe_confirm',
       question: '计划已生成，是否执行？',
-      detail: renderPlanDetail(plan),
+      detail: `需求澄清结论：\n${fullAnswer}\n\n────────────────\n${renderPlanDetail(plan)}`,
       options: [
         { label: '执行', description: '按计划并行执行子任务（Pro 规划 → Flash 执行 → Pro 复核）' },
         { label: '取消', description: '不执行任何子任务，结束本次 /pe' },
@@ -726,10 +726,10 @@ async function clarifyPhase(
   invocation: CommandInvocation,
   task: string,
   childEfforts: ChildEfforts,
-): Promise<string> {
+): Promise<{ summary: string; fullAnswer: string }> {
   const run = await spawn(
     ctx, config, invocation,
-    config.plannerModel, config.plannerEffort, childEfforts,
+    config.plannerModel, config.clarifyEffort, childEfforts,
     plannerPrompt(task), CLARIFY_INSTRUCTION,
     undefined, 'clarify',
   )
@@ -747,7 +747,12 @@ async function clarifyPhase(
   if (clarified.length === 0) {
     throw new Error('目标澄清无结果：请重新发送 /pe。')
   }
-  return clarified
+  // 拆出两段：需求摘要（喂规划器，精简）和完整答案（展示给用户）。
+  const summaryMatch = /【需求摘要】\s*([\s\S]*?)(?=【完整答案】|$)/iu.exec(clarified)
+  const fullMatch = /【完整答案】\s*([\s\S]*)/iu.exec(clarified)
+  const summary = (summaryMatch?.[1] ?? clarified).trim()
+  const fullAnswer = (fullMatch?.[1] ?? clarified).trim()
+  return { summary: summary.length > 0 ? summary : clarified, fullAnswer }
 }
 
 async function run(
@@ -763,14 +768,14 @@ async function run(
   const signal = invocation.signal
   try {
     // 对话式目标澄清：LLM 追问关键点直到目标明确，信息不足绝不猜测
-    const clarified = await clarifyPhase(ctx, config, invocation, task, childEfforts)
+    const clarification = await clarifyPhase(ctx, config, invocation, task, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
-    const plan = await planPhase(ctx, config, invocation, clarified, childEfforts)
+    const plan = await planPhase(ctx, config, invocation, clarification.summary, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
-      const approved = await confirmPlan(ctx, invocation, plan)
+      const approved = await confirmPlan(ctx, invocation, plan, clarification.fullAnswer)
       if (!approved) {
         return { kind: 'success', text: '已取消，未执行任何子任务。' }
       }
