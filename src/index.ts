@@ -912,41 +912,6 @@ async function confirmFix(
   return selected.includes('确认执行')
 }
 
-/**
- * 目标确认：把用户给出的需求摆给用户，确认理解后才继续规划。
- * 用户可确认，或补充更多信息（补充内容并入需求后返回）。
- */
-async function confirmGoal(
-  ctx: Context,
-  invocation: CommandInvocation,
-  requirement: string,
-): Promise<string> {
-  const answer = await ctx.userQuestions.ask({
-    questions: [{
-      id: 'pe_goal_confirm',
-      question: '请确认你的需求（确认后开始规划）：',
-      detail: requirement,
-      options: [
-        { label: '确认，开始规划', description: '进入规划阶段' },
-        { label: '还要补充', description: '补充更多信息后再规划' },
-      ],
-    }],
-    agent: invocation.agent,
-    signal: invocation.signal,
-  })
-  const item = answer.answers.find(entry => entry.id === 'pe_goal_confirm')
-  const selected = item?.selected ?? []
-  const custom = item?.custom?.trim() ?? ''
-  if (selected.includes('确认，开始规划')) {
-    return requirement
-  }
-  if (custom.length > 0) {
-    return `${requirement}\n\n【用户补充】${custom}`
-  }
-  // 没确认也没补充 → 视为确认，避免卡住。
-  return requirement
-}
-
 async function run(
   ctx: Context,
   config: Config,
@@ -963,24 +928,20 @@ async function run(
   }
   const signal = invocation.signal
   try {
-    // 需求确认：展示用户给出的需求，确认/补充后才规划。
-    // （需求澄清在普通对话里完成，/pe 只负责规划+执行+迭代，不再追问。）
-    const confirmedGoal = await confirmGoal(ctx, invocation, task)
-    if (signal.aborted) return { kind: 'error', text: '已停止' }
-
+    // 需求已在普通对话里明确，/pe 直接规划（不再弹"需求确认"）。
     // 增量迭代：读取工作区已有的项目档案，注入规划器作为"现状"，
     // 让规划器只拆本次需求相关的新/改任务，不重做已完成模块。
     const cwd = invocation.agent.session.header.cwd
     const priorState = cwd === undefined ? undefined : await readState(cwd)
     const planInput = priorState === undefined
-      ? confirmedGoal
-      : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${confirmedGoal}`
+      ? task
+      : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${task}`
 
     const plan = await planPhase(ctx, config, invocation, planInput, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
-      const approved = await confirmPlan(ctx, invocation, plan, confirmedGoal)
+      const approved = await confirmPlan(ctx, invocation, plan, task)
       if (!approved) {
         return { kind: 'success', text: '已取消，未执行任何子任务。' }
       }
