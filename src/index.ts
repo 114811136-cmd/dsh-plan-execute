@@ -407,13 +407,14 @@ async function spawn(
   personaText: string,
   outputSchema?: ObjectJsonSchema,
   labelSuffix?: string,
+  stopSignal?: AbortSignal,
 ): Promise<SubagentRun> {
   const run = await ctx.subagents.start(config.provider, {
     label: `pe:${model}${labelSuffix === undefined ? '' : `·${labelSuffix}`}`,
     persona: personaText,
     prompt: [textBlock(promptText)],
     parent: invocation.agent,
-    signal: invocation.signal,
+    signal: stopSignal === undefined ? invocation.signal : AbortSignal.any([invocation.signal, stopSignal]),
     agentOptions: { provider: config.llmProvider, model },
     maxDepth: config.maxDepth,
     ...(outputSchema === undefined ? {} : { outputSchema }),
@@ -550,15 +551,15 @@ async function executeOne(
   task: PlanTask,
   deps: TaskResult[],
   childEfforts: ChildEfforts,
+  stopSignal?: AbortSignal,
 ): Promise<TaskResult> {
   await sleep(jitteredDelay(config.stepIntervalMs), invocation.signal)
   const flashAttempts = config.maxRetries + 1
   let lastFailure = ''
   const taskStart = Date.now()
   for (let attempt = 0; attempt <= flashAttempts; attempt += 1) {
-    // A cancelled invocation aborts the loop immediately — no pointless retries
-    // against a dead signal.
-    if (invocation.signal.aborted) {
+    // A cancelled invocation or a user stop aborts the loop immediately.
+    if (invocation.signal.aborted || stopSignal?.aborted === true) {
       return { task_id: task.task_id, ok: false, text: '已停止', model: '—', elapsedMs: Date.now() - taskStart }
     }
     // Flash for attempts 0..maxRetries, then the planner model as the final fallback.
@@ -570,13 +571,13 @@ async function executeOne(
         ctx, config, invocation,
         model, effort, childEfforts,
         executorPrompt(task, deps), EXECUTOR_INSTRUCTION,
-        undefined, task.task_id,
+        undefined, task.task_id, stopSignal,
       )
       const result = await settleWithTimeout(run, childEfforts, config.executorTimeoutMs)
       if (result.stopReason === 'completed') {
         return { task_id: task.task_id, ok: true, text: extractText(result.output), model, elapsedMs: Date.now() - taskStart }
       }
-      if (invocation.signal.aborted) {
+      if (invocation.signal.aborted || stopSignal?.aborted === true) {
         return { task_id: task.task_id, ok: false, text: '已停止', model, elapsedMs: Date.now() - taskStart }
       }
       // 超时 → 可重试的第一级兜底；基础设施故障保留原始错误。
@@ -588,7 +589,7 @@ async function executeOne(
         lastFailure = `stopReason=${result.stopReason}`
       }
     } catch (error: unknown) {
-      if (invocation.signal.aborted) {
+      if (invocation.signal.aborted || stopSignal?.aborted === true) {
         return { task_id: task.task_id, ok: false, text: '已停止', model, elapsedMs: Date.now() - taskStart }
       }
       lastFailure = error instanceof Error ? error.message : String(error)
@@ -604,6 +605,7 @@ async function executePhase(
   invocation: CommandInvocation,
   plan: Plan,
   childEfforts: ChildEfforts,
+  stopSignal?: AbortSignal,
 ): Promise<TaskResult[]> {
   const ordered = topoOrder(plan.tasks)
   const results = new Array<TaskResult>(ordered.length)
@@ -620,8 +622,8 @@ async function executePhase(
 
   const workers = Array.from({ length: workerCount }, async () => {
     for (;;) {
-      // A cancelled invocation stops the scan — no further tasks are claimed.
-      if (invocation.signal.aborted) break
+      // A cancelled invocation or a user stop stops the scan.
+      if (invocation.signal.aborted || stopSignal?.aborted === true) break
       // Synchronous scan-and-claim (no `await` inside) so two workers cannot
       // grab the same task; the `stepIntervalMs` jitter still runs inside
       // `executeOne`, preserving the rate-limit ramp.
@@ -651,7 +653,7 @@ async function executePhase(
       const deps: TaskResult[] = (task.depend_on ?? [])
         .map(id => resultById.get(id))
         .filter((result): result is TaskResult => result !== undefined)
-      const result = await executeOne(ctx, config, invocation, task, deps, childEfforts)
+      const result = await executeOne(ctx, config, invocation, task, deps, childEfforts, stopSignal)
       results[index] = result
       resultById.set(task.task_id, result)
       done.add(task.task_id)
@@ -948,8 +950,38 @@ async function run(
       if (signal.aborted) return { kind: 'error', text: '已停止' }
     }
 
-    let results = await executePhase(ctx, config, invocation, plan, childEfforts)
+    // 执行阶段：并发弹「停止」监控框，用户可随时中断剩余子任务。
+    const stopController = new AbortController()
+    const askCancel = new AbortController()
+    const stopMonitor = (async () => {
+      try {
+        await ctx.userQuestions.ask({
+          questions: [{
+            id: 'pe_stop',
+            question: '任务执行中…',
+            detail: '可随时点「停止」立即中断剩余子任务（已完成的保留）。',
+            options: [
+              { label: '停止', description: '立即停止剩余子任务' },
+            ],
+          }],
+          agent: invocation.agent,
+          signal: askCancel.signal,
+        })
+        stopController.abort()
+      } catch {
+        // 执行完成，监控框被取消。
+      }
+    })()
+
+    let results = await executePhase(ctx, config, invocation, plan, childEfforts, stopController.signal)
+    askCancel.abort()
+    await stopMonitor.catch(() => {})
     if (signal.aborted) return { kind: 'error', text: '已停止' }
+    if (stopController.signal.aborted) {
+      // 用户主动停止：跳过复核/完工验收，直接返回已完成的结果。
+      const doneCount = results.filter(r => r !== undefined).length
+      return { kind: 'success', text: `已停止执行（完成 ${doneCount}/${plan.tasks.length} 个子任务）。\n\n${renderSummary(plan, results, undefined)}` }
+    }
 
     let verdict: ReviewVerdict | undefined
     if (config.review) {
