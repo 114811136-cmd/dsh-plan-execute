@@ -463,20 +463,34 @@ async function settle(run: SubagentRun, childEfforts: ChildEfforts): Promise<Sub
 // Each is mounted as the child's `persona` (system position, cache-stable).
 // Keep them static; dynamic data goes in the user `prompt`.
 
+/** Object-rooted JSON schema for the clarify-judge's structured output. */
+const CLARIFY_JUDGE_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['done'],
+  properties: {
+    done: { type: 'boolean' },
+    question: { type: 'string' },
+    summary: { type: 'string' },
+  },
+}
+
+/**
+ * The clarify judge only THINKS about the next question (or decides the goal
+ * is clear); it never asks the user itself — the MAIN task owns the question
+ * channel (only a runtime-root agent may call userQuestions.ask).
+ */
 const CLARIFY_INSTRUCTION = [
-  '你处于「需求审问模式」。用户的请求只是起点，你的唯一职责是把真实需求问清楚。',
-  '铁律：禁止直接给出最终答案或方案。在需求没有问清楚之前，禁止输出任何方案、计划或结论。',
-  '追问规则：',
-  '1. 一次只问 1 个最关键的问题：使用 ask_user_question 工具，每轮只提 1 个问题（带稳定 id），绝不要一次抛多个问题。',
-  '2. 基于回答继续追问：每一轮问题必须紧接用户上一轮的答案深入，形成追问链，而不是平行罗列问题。',
-  '3. 每轮问题必须尖锐、具体、必要：不能泛泛而问（如"还有吗""能再说说吗"），不能重复已问过的问题，只问真正影响方案走向的关键点。',
-  '4. 要问清楚的全部维度：真实需求（到底要解决什么问题、核心痛点是什么）、使用场景（在什么情况下用、谁在用）、目标结果（做到什么程度算成功）、限制条件（时间/预算/技术/环境/合规约束）、判断标准（怎么验收才算通过）、隐藏偏好（用户没明说但影响选择的倾向）。',
-  '5. 克制提问：每轮只问当前最影响方案的那一个问题，不要为问而问。',
-  '停止条件：当你认为已经基本理解用户的真实需求，并能据此给出可执行方案时，立即停止追问，不要再问。',
-  '停止追问后，输出两段内容，用标题严格隔开：',
-  '第一段标题为「【需求摘要】」：只写内部规划所需的精简信息——真实需求、约束条件、验收标准、关键提醒各一句话。不要写方案、理由或执行步骤（这些由后续规划阶段生成）。',
-  '第二段标题为「【完整答案】」：给用户看的完整答案，必须包含五部分——真实需求、最适合的方案、为什么这样做、具体执行步骤、最容易忽略的关键提醒。',
-  '输出为纯文本，不要输出 JSON，不要输出多余格式。',
+  '你是需求澄清的提问大脑。你会看到用户的初始需求，以及已经问过的问题和用户的回答。',
+  '你的任务是判断需求是否已足够明确，并输出严格 JSON（禁止任何额外解释或 markdown 代码块）。',
+  '输出格式二选一：{"done":false,"question":"你下一个要问的最关键问题"} 或 {"done":true,"summary":"明确后的需求摘要"}',
+  '追问规则（done=false 时）：',
+  '1. 一次只问 1 个最关键的问题，尖锐、具体、必要，不泛泛而问、不重复已问过的问题。',
+  '2. 紧接用户上一轮的回答深入追问，形成追问链。',
+  '3. 要问清楚的维度：真实需求、使用场景、目标结果、限制条件、判断标准、隐藏偏好。',
+  '4. 禁止猜测用户意图；信息不足就问，但不要为问而问。',
+  '停止规则（done=true 时）：当你已基本理解真实需求并能据此给出可执行方案时，输出 summary。',
+  'summary 必须用精简文字写明：真实需求、约束条件、验收标准、关键提醒（各一句）。',
 ].join('\n')
 
 const PLANNER_INSTRUCTION = [
@@ -922,9 +936,10 @@ async function confirmFix(
 }
 
 /**
- * LLM 驱动的目标澄清：spawn 一个澄清者子代理，通过 ask_user_question 工具
- * 与用户多轮对话，直到目标足够明确才输出最终目标描述。信息不足绝不猜测。
- * 带硬超时（clarifyTimeoutMs），超时即中止，防止澄清阶段无限卡住。
+ * LLM 驱动的目标澄清（需求审问模式）：
+ * 子代理只负责"思考下一个该问的问题"，主任务（runtime root）负责"弹框提问"。
+ * 只有主任务才能调用 userQuestions.ask；子代理提问会被 DSH 以 DELEGATED_CALLER 拒绝。
+ * 循环追问直到子代理判断需求已明确，或达到轮数上限。
  */
 async function clarifyPhase(
   ctx: Context,
@@ -933,32 +948,68 @@ async function clarifyPhase(
   task: string,
   childEfforts: ChildEfforts,
 ): Promise<{ summary: string; fullAnswer: string }> {
-  const run = await spawn(
-    ctx, config, invocation,
-    config.plannerModel, config.clarifyEffort, childEfforts,
-    plannerPrompt(task), CLARIFY_INSTRUCTION,
-    undefined, 'clarify',
-  )
-  const result = await settleWithTimeout(run, childEfforts, config.clarifyTimeoutMs)
-  if (invocation.signal.aborted) {
-    throw new Error('已停止')
+  const history: string[] = [`用户初始需求：${task}`]
+  const maxRounds = 5
+  let summary = task
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    if (invocation.signal.aborted) throw new Error('已停止')
+
+    // 1. 子代理判断：还需要问什么？或者需求已明确？
+    const prompt = [
+      ...history,
+      '',
+      '请判断需求是否已足够明确，并按要求输出 JSON。',
+    ].join('\n')
+    const run = await spawn(
+      ctx, config, invocation,
+      config.plannerModel, config.clarifyEffort, childEfforts,
+      prompt, CLARIFY_INSTRUCTION, CLARIFY_JUDGE_SCHEMA, `clarify-judge-${round}`,
+    )
+    const result = await settleWithTimeout(run, childEfforts, config.clarifyTimeoutMs)
+    if (invocation.signal.aborted) throw new Error('已停止')
+    if (result.stopReason !== 'completed' || result.timedOut) {
+      // 判断失败不阻塞整个 /pe：用已有信息继续。
+      summary = history.join('\n')
+      break
+    }
+    const judge = (result.structured ?? parseJson(extractText(result.output))) as
+      | { done?: boolean; question?: string; summary?: string } | undefined
+
+    // 子代理认为已明确 → 返回摘要。
+    if (judge?.done === true && typeof judge.summary === 'string' && judge.summary.trim().length > 0) {
+      summary = judge.summary.trim()
+      break
+    }
+    const question = typeof judge?.question === 'string' ? judge.question.trim() : ''
+    if (question.length === 0) {
+      summary = (judge?.summary ?? '').trim() || history.join('\n')
+      break
+    }
+
+    // 2. 主任务提问（runtime root 才有资格问用户）。
+    const answer = await ctx.userQuestions.ask({
+      questions: [{
+        id: `pe_clarify_${round}`,
+        question,
+        detail: '请直接输入你的回答',
+      }],
+      agent: invocation.agent,
+      signal: invocation.signal,
+    })
+    if (invocation.signal.aborted) throw new Error('已停止')
+    const item = answer.answers.find(entry => entry.id === `pe_clarify_${round}`)
+    const reply = (item?.custom ?? '').trim() || (item?.selected ?? []).join('、')
+    if (reply.length === 0) {
+      // 用户没回答 → 结束，用已有信息。
+      summary = (judge.summary ?? '').trim() || history.join('\n')
+      break
+    }
+    history.push(`问：${question}`, `答：${reply}`)
   }
-  if (result.stopReason !== 'completed' || result.timedOut) {
-    const why = result.timedOut
-      ? `目标澄清超时（${Math.round(config.clarifyTimeoutMs / 1000)}s）`
-      : `stopReason=${result.stopReason}`
-    throw new Error(`目标澄清失败：${why}。请重新发送 /pe 并给出更清晰的目标。`)
-  }
-  const clarified = extractText(result.output).trim()
-  if (clarified.length === 0) {
-    throw new Error('目标澄清无结果：请重新发送 /pe。')
-  }
-  // 拆出两段：需求摘要（喂规划器，精简）和完整答案（展示给用户）。
-  const summaryMatch = /【需求摘要】\s*([\s\S]*?)(?=【完整答案】|$)/iu.exec(clarified)
-  const fullMatch = /【完整答案】\s*([\s\S]*)/iu.exec(clarified)
-  const summary = (summaryMatch?.[1] ?? clarified).trim()
-  const fullAnswer = (fullMatch?.[1] ?? clarified).trim()
-  return { summary: summary.length > 0 ? summary : clarified, fullAnswer }
+
+  if (summary.length === 0) summary = history.join('\n')
+  return { summary, fullAnswer: summary }
 }
 
 async function run(
