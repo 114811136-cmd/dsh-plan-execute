@@ -728,14 +728,19 @@ function renderPlanDetail(plan: Plan): string {
 }
 
 /** Ask the user to approve the plan before any executor runs. */
-async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Plan, fullAnswer: string): Promise<boolean> {
+async function confirmPlan(
+  ctx: Context,
+  invocation: CommandInvocation,
+  plan: Plan,
+  fullAnswer: string,
+): Promise<{ action: 'execute' | 'cancel' | 'revise'; reviseText: string }> {
   const answer = await ctx.userQuestions.ask({
     questions: [{
       id: 'pe_confirm',
-      question: '计划已生成，是否执行？',
-      detail: `需求澄清结论：\n${fullAnswer}\n\n────────────────\n${renderPlanDetail(plan)}`,
+      question: '计划已生成，确认执行、取消，或填写修改要求：',
+      detail: `需求：${fullAnswer}\n\n${renderPlanDetail(plan)}\n\n若需修改，请直接在下方输入（例如：T003 改成柱状图）。`,
       options: [
-        { label: '执行', description: '按计划并行执行子任务（Pro 规划 → Flash 执行 → Pro 复核）' },
+        { label: '执行', description: '按计划并行执行子任务' },
         { label: '取消', description: '不执行任何子任务，结束本次 /pe' },
       ],
       intent: { kind: 'plan-review', approve: '执行' },
@@ -743,8 +748,16 @@ async function confirmPlan(ctx: Context, invocation: CommandInvocation, plan: Pl
     agent: invocation.agent,
     signal: invocation.signal,
   })
-  const selected = answer.answers.find(item => item.id === 'pe_confirm')?.selected ?? []
-  return selected.includes('执行')
+  const item = answer.answers.find(entry => entry.id === 'pe_confirm')
+  const selected = item?.selected ?? []
+  const custom = item?.custom?.trim() ?? ''
+  if (selected.includes('执行')) {
+    return { action: 'execute', reviseText: '' }
+  }
+  if (custom.length > 0) {
+    return { action: 'revise', reviseText: custom }
+  }
+  return { action: 'cancel', reviseText: '' }
 }
 
 /** One diagnosis item: which subtask to fix, why, and its revised description. */
@@ -939,15 +952,24 @@ async function run(
       ? task
       : `【现有项目现状】\n${renderStatePrompt(priorState)}\n\n【本次需求】\n${task}`
 
-    const plan = await planPhase(ctx, config, invocation, planInput, childEfforts)
+    let plan = await planPhase(ctx, config, invocation, planInput, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
 
     if (config.confirm) {
-      const approved = await confirmPlan(ctx, invocation, plan, task)
-      if (!approved) {
-        return { kind: 'success', text: '已取消，未执行任何子任务。' }
+      // 计划确认 + 可修改循环：用户可确认执行/取消，或填写修改要求重新规划。
+      let reviseHistory = ''
+      for (;;) {
+        const decision = await confirmPlan(ctx, invocation, plan, task)
+        if (signal.aborted) return { kind: 'error', text: '已停止' }
+        if (decision.action === 'cancel') {
+          return { kind: 'success', text: '已取消，未执行任何子任务。' }
+        }
+        if (decision.action === 'execute') break
+        // 修改：累积修改要求，重新规划，再展示计划。
+        reviseHistory += `\n\n【用户修改要求】${decision.reviseText}`
+        plan = await planPhase(ctx, config, invocation, `${planInput}${reviseHistory}`, childEfforts)
+        if (signal.aborted) return { kind: 'error', text: '已停止' }
       }
-      if (signal.aborted) return { kind: 'error', text: '已停止' }
     }
 
     // 执行阶段：并发弹「停止」监控框，用户可随时中断剩余子任务。
