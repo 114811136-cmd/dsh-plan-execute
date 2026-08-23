@@ -972,38 +972,9 @@ async function run(
       }
     }
 
-    // 执行阶段：并发弹「停止」监控框，用户可随时中断剩余子任务。
-    const stopController = new AbortController()
-    const askCancel = new AbortController()
-    const stopMonitor = (async () => {
-      try {
-        await ctx.userQuestions.ask({
-          questions: [{
-            id: 'pe_stop',
-            question: '任务执行中…',
-            detail: '可随时点「停止」立即中断剩余子任务（已完成的保留）。',
-            options: [
-              { label: '停止', description: '立即停止剩余子任务' },
-            ],
-          }],
-          agent: invocation.agent,
-          signal: askCancel.signal,
-        })
-        stopController.abort()
-      } catch {
-        // 执行完成，监控框被取消。
-      }
-    })()
-
-    let results = await executePhase(ctx, config, invocation, plan, childEfforts, stopController.signal)
-    askCancel.abort()
-    await stopMonitor.catch(() => {})
+    // 执行阶段（无并发停止框——DSH 命令执行不支持并发弹窗，会导致会话视图异常）。
+    let results = await executePhase(ctx, config, invocation, plan, childEfforts)
     if (signal.aborted) return { kind: 'error', text: '已停止' }
-    if (stopController.signal.aborted) {
-      // 用户主动停止：跳过复核/完工验收，直接返回已完成的结果。
-      const doneCount = results.filter(r => r !== undefined).length
-      return { kind: 'success', text: `已停止执行（完成 ${doneCount}/${plan.tasks.length} 个子任务）。\n\n${renderSummary(plan, results, undefined)}` }
-    }
 
     let verdict: ReviewVerdict | undefined
     if (config.review) {
